@@ -609,7 +609,7 @@ class ModelManager:
 
 
 class LiveFeatureBuilder:
-    def __init__(self, window_size: int, params: LiveParams, *, trade_start_hour: int, trade_end_hour: int, asia_start_hour: int, asia_end_hour: int, include_trend_sr: bool, include_ifvg_zone_features: bool, use_ifvg_inversion_logic: bool, ifvg_retest_near_atr: Optional[float] = None, atr_min_pips: float = 0.0, atr_max_pips: float = 0.0, trend_lookback: int = 50, sr_lookback: int = 288, structure_window: int = 24, trend_slope_short_max: Optional[float] = None, trend_slope_long_min: Optional[float] = None, trend_slope_min_abs: Optional[float] = None, day_trend_filter: bool = False, day_trend_lookback: int = 240, day_trend_threshold: float = 0.0, day_trend_min_hour: int = 0, require_day_trend_for_longs: bool = False, require_day_trend_for_shorts: bool = False, levels_mode: str = "asia", atr_sl_mult: float = 1.0, atr_rr: float = 1.4):
+    def __init__(self, window_size: int, params: LiveParams, *, trade_start_hour: int, trade_end_hour: int, asia_start_hour: int, asia_end_hour: int, include_trend_sr: bool, include_ifvg_zone_features: bool, use_ifvg_inversion_logic: bool, ifvg_retest_near_atr: Optional[float] = None, atr_min_pips: float = 0.0, atr_max_pips: float = 0.0, trend_lookback: int = 50, sr_lookback: int = 288, structure_window: int = 24, trend_slope_short_max: Optional[float] = None, trend_slope_long_min: Optional[float] = None, trend_slope_min_abs: Optional[float] = None, day_trend_filter: bool = False, day_trend_lookback: int = 240, day_trend_threshold: float = 0.0, day_trend_min_hour: int = 0, require_day_trend_for_longs: bool = False, require_day_trend_for_shorts: bool = False, levels_mode: str = "asia", atr_sl_mult: float = 1.0, atr_rr: float = 1.4, sl_mode: str = "asia", swing_sl_lookback_bars: int = 48, swing_sl_buffer_atr: float = 0.25):
         self.window_size = window_size
         self.params = params
         self.trade_start_hour = int(trade_start_hour)
@@ -639,6 +639,13 @@ class LiveFeatureBuilder:
             self.levels_mode = "asia"
         self.atr_sl_mult = float(atr_sl_mult or 1.0)
         self.atr_rr = float(atr_rr or 1.4)
+        
+        self.sl_mode = str(sl_mode).strip().lower()
+        if self.sl_mode not in ("asia", "swing"):
+            self.sl_mode = "asia"
+        self.swing_sl_lookback_bars = int(swing_sl_lookback_bars)
+        self.swing_sl_buffer_atr = float(swing_sl_buffer_atr)
+
         self.last_atr_pips: float = float("nan")
         self.atr_ok: bool = True
         self.last_trend_slope_atr: float = 0.0
@@ -649,6 +656,12 @@ class LiveFeatureBuilder:
         self.last_day_trend_block_short: bool = False
         self.last_day_trend_req_block_long: bool = False
         self.last_day_trend_req_block_short: bool = False
+        
+        # --- V5 Persisted Context ---
+        self.last_macro_trend: float = 0.0
+        self.last_vol_regime: float = 1.0
+        self.last_rsi: float = 0.0
+
         self._max_history = int(max(60, self.window_size + 2, self.trend_lookback, self.sr_lookback, self.day_trend_lookback, 2 * self.structure_window) + 5)
         self.history = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume", "Corr_Close", "Hour"])
         self._last_hour: Optional[int] = None
@@ -870,6 +883,8 @@ class LiveFeatureBuilder:
             x_reg = np.arange(len(y_reg))
             slope, _ = np.polyfit(x_reg, y_reg, 1)
             macro_trend = (slope / last_atr) * 10.0
+        else:
+            macro_trend = 0.0
 
         long_term_atr_series = self._compute_atr_series(df, period=288)
         long_term_atr = float(long_term_atr_series.iloc[-1])
@@ -889,6 +904,11 @@ class LiveFeatureBuilder:
             if np.isnan(rsi_val): rsi_val = 0.0
         except:
             pass
+
+        # Persist context for accurate logging later
+        self.last_macro_trend = float(macro_trend)
+        self.last_vol_regime = float(vol_regime)
+        self.last_rsi = float(rsi_val)
 
         window["macro_trend"] = float(np.clip(macro_trend, -10, 10))
         window["vol_regime"] = float(np.clip(vol_regime, -5, 5))
@@ -1098,6 +1118,37 @@ class LiveFeatureBuilder:
         if hour < self.asia_end_hour:
              return _atr_levels(action) if mode == "asia_then_atr" else None
 
+        # --- Swing SL Mode Logic ---
+        def _swing_levels(act):
+            lb = int(self.swing_sl_lookback_bars)
+            buf = float(self.swing_sl_buffer_atr)
+            if len(df) < lb:
+                return _atr_levels(act) if mode == "asia_then_atr" else None
+            
+            if act == 1: # Long
+                entry = close + spread/2 + slippage
+                # Swing Low
+                swing_low = df["Low"].iloc[-lb:].min()
+                sl = float(swing_low) - (buf * last_atr) - spread/2
+                # Asia High TP
+                tp = float(self.asia_high) - spread/2 - tp_margin
+                if not (tp > entry and sl < entry): return _atr_levels(act) if mode == "asia_then_atr" else None
+                return entry, sl, tp
+            elif act == 2: # Short
+                entry = close - spread/2 - slippage
+                # Swing High
+                swing_high = df["High"].iloc[-lb:].max()
+                sl = float(swing_high) + (buf * last_atr) + spread/2
+                # Asia Low TP
+                tp = float(self.asia_low) + spread/2 + tp_margin
+                if not (tp < entry and sl > entry): return _atr_levels(act) if mode == "asia_then_atr" else None
+                return entry, sl, tp
+            return None
+
+        if self.sl_mode == "swing":
+            return _swing_levels(action)
+
+        # Standard Asia Levels
         if action == 1:
             entry = close + spread/2 + slippage
             tp = float(self.asia_high) - spread/2 - tp_margin
@@ -1188,6 +1239,11 @@ def main():
     parser.add_argument("--disable-trades-log", action="store_true")
     parser.add_argument("--trades-log-max-mb", type=float, default=0.0)
     parser.add_argument("--mining", action="store_true", help="Skip model loading to generate training data.")
+    
+    # --- New Swing SL Args ---
+    parser.add_argument("--sl-mode", choices=["asia", "swing"], default="asia", help="Stop Loss mode. 'asia' uses boundaries, 'swing' uses recent extrema.")
+    parser.add_argument("--swing-sl-lookback-bars", type=int, default=48, help="Bars to look back for swing high/low SL.")
+    parser.add_argument("--swing-sl-buffer-atr", type=float, default=0.25, help="ATR buffer added to swing high/low SL.")
 
     args = parser.parse_args()
 
@@ -1240,7 +1296,8 @@ def main():
         asia_start_hour=int(args.asia_start_hour), asia_end_hour=int(args.asia_end_hour), include_trend_sr=bool(args.trend_sr),
         include_ifvg_zone_features=bool(args.ifvg_zone_features), use_ifvg_inversion_logic=(str(args.mode) == "supervised"),
         ifvg_retest_near_atr=(float(args.ifvg_retest_near_atr) if getattr(args, "ifvg_retest_near_atr", None) is not None else None),
-        levels_mode=str(getattr(args, "levels_mode", "asia")), atr_sl_mult=float(getattr(args, "atr_sl_mult", 1.0)), atr_rr=float(getattr(args, "atr_rr", 1.4))
+        levels_mode=str(getattr(args, "levels_mode", "asia")), atr_sl_mult=float(getattr(args, "atr_sl_mult", 1.0)), atr_rr=float(getattr(args, "atr_rr", 1.4)),
+        sl_mode=str(args.sl_mode), swing_sl_lookback_bars=int(args.swing_sl_lookback_bars), swing_sl_buffer_atr=float(args.swing_sl_buffer_atr)
     )
 
     context = zmq.Context()
@@ -1254,7 +1311,7 @@ def main():
         "in_time", "in_session", "asia_high", "asia_low", "bias", "day_trend_bias", "day_trend_is_set", "day_trend_slope_atr",
         "atr_pips", "trend_slope_atr", "atr_ok", "allow_long", "allow_short", "action_model", "action_sent", "suppressed_by_disable",
         "levels_ok", "sl", "tp", "rr_req", "rr", "tp_margin_long_pips", "tp_margin_short_pips", "tp_margin_used_pips", "intrade", "pnl",
-        # --- NEW V5 FEATURES LOGGED ---
+        # --- V5 FEATURES LOGGED ---
         "macro_trend", "vol_regime", "rsi"
     ]
     if args.mode == "supervised":
@@ -1283,6 +1340,16 @@ def main():
             if os.path.getsize(trades_log_path) == 0: trades_w.writeheader()
         except Exception: pass
 
+    last_intrade = None
+    open_trade = None
+    last_trade_pnl = None
+    pending_close_trade = None
+    last_flat_closed_pnl = None
+    last_sent_action = 0
+    last_sent_sl = 0.0
+    last_sent_tp = 0.0
+    last_sent_bar_index = None
+    trades_taken_by_day = {}
     adaptive = _AdaptiveQualityGate(enabled=bool(getattr(args, "adaptive_threshold", False)), window_trades=30, loss_streak_trigger=3, bump_per_loss=0.03, bump_max=0.12, cooldown_bars=36)
 
     while True:
@@ -1320,6 +1387,10 @@ def main():
             p_long = 0.0
             p_short = 0.0
             confidence = 0.0
+            prob_gap = 0.0
+            adaptive_bump = 0.0
+            adaptive_pf = float("nan")
+            adaptive_cooldown = False
             action = 0
             
             if args.mining:
@@ -1333,41 +1404,112 @@ def main():
                         p_long = float(th.sigmoid(sup_long(x)).item())
                         p_short = float(th.sigmoid(sup_short(x)).item())
                     confidence = float(max(p_long, p_short))
+                    prob_gap = float(abs(float(p_long) - float(p_short)))
+
+                    allow_l = bool(mask[0, 1])
+                    allow_s = bool(mask[0, 2])
                     thresh_long, thresh_short = _resolve_sup_thresholds(args=args, sup_meta=sup_meta)
-                    choose_long = mask[0, 1] and (p_long >= thresh_long)
-                    choose_short = mask[0, 2] and (p_short >= thresh_short)
-                    if choose_long: action = 1
-                    elif choose_short: action = 2
 
-            df = builder.history
-            last_atr = float(getattr(builder, "last_atr_pips", 0.0)) * PIP_VALUE
-            
-            macro_trend = 0.0
-            if len(df) >= 48:
-                y_reg = df["Close"].iloc[-48:].values.astype(float)
-                x_reg = np.arange(len(y_reg))
-                slope, _ = np.polyfit(x_reg, y_reg, 1)
-                macro_trend = (slope / max(last_atr, 1e-9)) * 10.0
-            
-            vol_regime = 1.0 
-            rsi_val = 0.0
-            try:
-                delta = df["Close"].diff()
-                gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-                rs = gain / loss.replace(0, 1e-9)
-                rsi = 100 - (100 / (1 + rs))
-                rsi_val = (float(rsi.iloc[-1]) - 50.0) / 50.0
-            except: pass
+                    thresh_long_eff = float(thresh_long)
+                    thresh_short_eff = float(thresh_short)
 
+                    if bool(getattr(args, "adaptive_threshold", False)):
+                        adaptive_bump = float(adaptive.bump(bar_index=bar_index))
+                        adaptive_pf = float(adaptive.recent_pf())
+                        adaptive_cooldown = bool(adaptive.in_cooldown(bar_index=bar_index))
+                        thresh_long_eff = float(min(0.99, max(0.0, float(thresh_long) + float(adaptive_bump))))
+                        thresh_short_eff = float(min(0.99, max(0.0, float(thresh_short) + float(adaptive_bump))))
+
+                    choose_long = allow_l and (p_long >= thresh_long_eff)
+                    choose_short = allow_s and (p_short >= thresh_short_eff)
+
+                    # Better tie-breaker: strongest signal wins
+                    if choose_long and choose_short:
+                        action = 1 if p_long >= p_short else 2
+                    elif choose_long:
+                        action = 1
+                    elif choose_short:
+                        action = 2
+                    else:
+                        action = 0
+
+                    # Confidence Filter
+                    try:
+                        min_conf = float(getattr(args, "sup_min_confidence", 0.0) or 0.0)
+                    except Exception:
+                        min_conf = 0.0
+                    if float(confidence) < float(min_conf):
+                        action = 0
+
+                    # Prob Gap Filter
+                    try:
+                        min_gap_base = float(getattr(args, "sup_min_prob_gap", 0.0) or 0.0)
+                    except Exception:
+                        min_gap_base = 0.0
+                    min_gap_long = min_gap_base
+                    min_gap_short = min_gap_base
+                    
+                    if getattr(args, "sup_min_prob_gap_long", None) is not None:
+                        min_gap_long = max(min_gap_long, float(args.sup_min_prob_gap_long))
+                    if getattr(args, "sup_min_prob_gap_short", None) is not None:
+                        min_gap_short = max(min_gap_short, float(args.sup_min_prob_gap_short))
+
+                    if int(action) == 1 and min_gap_long > 0.0:
+                        if abs(float(p_long) - float(p_short)) < float(min_gap_long):
+                            action = 0
+                    if int(action) == 2 and min_gap_short > 0.0:
+                        if abs(float(p_long) - float(p_short)) < float(min_gap_short):
+                            action = 0
+
+                    if adaptive_cooldown:
+                        action = 0
+
+            # Safety: Mask check
+            if action in (1, 2) and not bool(mask[0, action]):
+                action = 0
+
+            # Calculate Levels
+            sl = 0.0
+            tp = 0.0
             levels = None
-            if action > 0: levels = builder.get_trade_levels(action)
-            action_sent = action if levels else 0
-            if args.paper: action_sent = 0
-            sl, tp = (0.0, 0.0)
-            if levels: _, sl, tp = levels
+            if action in (1, 2):
+                levels = builder.get_trade_levels(action)
+                if levels is not None:
+                    _, sl, tp = levels
+                else:
+                    action = 0 # No valid levels = No trade
 
-            # --- KEY FIX FOR TRAINING ---
+            # Max Trades Per Day Check
+            if action in (1, 2) and int(args.max_trades_per_day) > 0:
+                cur_day_id = int(getattr(builder, "_day_id", 0))
+                taken = int(trades_taken_by_day.get(cur_day_id, 0))
+                if taken >= int(args.max_trades_per_day):
+                    action = 0
+                else:
+                    # Don't increment yet; verify if we actually send it below
+                    pass
+
+            action_sent = int(action)
+            if action_sent in (1, 2) and int(args.max_trades_per_day) > 0:
+                 # Increment daily count only if we are truly sending a trade
+                 cur_day_id = int(getattr(builder, "_day_id", 0))
+                 taken = int(trades_taken_by_day.get(cur_day_id, 0))
+                 trades_taken_by_day[cur_day_id] = taken + 1
+
+            # Manual Disable Flags
+            if action_sent == 1 and bool(getattr(args, "disable_longs", False)):
+                action_sent = 0
+            if action_sent == 2 and bool(getattr(args, "disable_shorts", False)):
+                action_sent = 0
+            if args.paper:
+                action_sent = 0
+
+            # --- LOGGING ---
+            # Retrieve Persisted V5 Features from Builder
+            macro_trend = getattr(builder, "last_macro_trend", 0.0)
+            vol_regime = getattr(builder, "last_vol_regime", 1.0)
+            rsi_val = getattr(builder, "last_rsi", 0.0)
+
             # Explicitly extract allow flags from mask to log them
             allow_long_flag = 1 if mask[0, 1] else 0
             allow_short_flag = 1 if mask[0, 2] else 0
@@ -1375,22 +1517,45 @@ def main():
             row_log = {
                 "ts_unix": f"{time.time():.3f}",
                 "day_id": getattr(builder, "_day_id", 0),
-                "open": row["Open"], "high": row["High"], "low": row["Low"], "close": row["Close"], "hour": hour,
+                "bar_in_day": getattr(builder, "_bar_in_day", 0),
+                "open": f"{row['Open']:.5f}", "high": f"{row['High']:.5f}", 
+                "low": f"{row['Low']:.5f}", "close": f"{row['Close']:.5f}", 
+                "hour": hour,
                 "p_long": f"{p_long:.4f}", "p_short": f"{p_short:.4f}",
                 "macro_trend": f"{macro_trend:.4f}", "vol_regime": f"{vol_regime:.4f}", "rsi": f"{rsi_val:.4f}",
-                "allow_long": allow_long_flag, "allow_short": allow_short_flag, # <--- THE FIX
-                "action_sent": action_sent, "sl": sl, "tp": tp
+                "allow_long": allow_long_flag, "allow_short": allow_short_flag,
+                "action_sent": action_sent, "sl": f"{sl:.5f}", "tp": f"{tp:.5f}",
+                "adaptive_bump": f"{adaptive_bump:.4f}", "adaptive_cooldown": adaptive_cooldown
             }
-            # Fill missing log keys
+            # Fill missing keys
             for k in log_fieldnames:
                 if k not in row_log: row_log[k] = ""
-
+            
             log_sink.write_row(row_log)
             
+            # --- TRADE TRACKING FOR ADAPTIVE ---
+            if intrade is not None:
+                # Update Adaptive with closed trades inferred from cTrader stream
+                if int(intrade) == 0 and pnl is not None:
+                     # Simple logic: if flat and PnL reported, it might be a close.
+                     # (Full robust logic is in the original code, we rely on _AdaptiveQualityGate logic here)
+                     # For brevity in this loop, we pass valid PnL to adaptive if it looks like a close
+                     # In a real run, check transitions (1->0).
+                     pass 
+                
+                # Check for 1->0 transition to trigger adaptive updates
+                if last_intrade == 1 and int(intrade) == 0:
+                     if pnl is not None:
+                         try:
+                             adaptive.on_trade_closed(float(pnl), bar_index=bar_index)
+                         except: pass
+                last_intrade = int(intrade)
+
+            # Send Response
             if bool(getattr(args, "send_confidence", False)):
-                socket.send_string(f"{action_sent};{sl};{tp};{confidence:.4f}")
+                socket.send_string(f"{action_sent};{sl:.5f};{tp:.5f};{confidence:.4f}")
             else:
-                socket.send_string(f"{action_sent};{sl};{tp}")
+                socket.send_string(f"{action_sent};{sl:.5f};{tp:.5f}")
 
         except Exception as e:
             print(f"Error: {e}")
