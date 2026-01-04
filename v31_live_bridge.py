@@ -1,521 +1,1401 @@
-"""v31_live_bridge.py
-
-Live bridge / trading runner.
-
-This file is a merged, cleaned-up version based on the prior v31_live_bridge.py
-and improvements from v31_live_bridge.2.py.
-
-Key additions/fixes (see README/CLI help for details):
-  1) Mining logs: store the exact macro_trend, vol_regime, and rsi values used in
-     obs on LiveFeatureBuilder and log those values.
-  2) Supervised chooser: when both long and short pass thresholds, pick the side
-     with higher probability.
-  3) Apply supervised filters: sup-min-confidence and sup-min-prob-gap with
-     per-side overrides.
-  4) AdaptiveQualityGate: bump thresholds, enforce cooldown, and log stats.
-  5) Enforce max-trades-per-day.
-  6) Supervised input-dim check works for mlp/transformer/lstm.
-  7) Keep levels-mode asia_then_atr behavior compatible with prior command.
-  8) Optional --sl-mode swing: SL at recent swing low/high with optional ATR
-     buffer (disabled by default).
-
-Note: This module is intentionally self-contained and defensive: if some optional
-classes/functions are not present in the repo, it degrades gracefully.
-"""
-
-from __future__ import annotations
-
 import argparse
-import dataclasses
-import datetime as _dt
-import json
-import math
+import atexit
+import csv
+import glob
 import os
-import sys
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+import math
+import errno
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Optional, Tuple
+
+import numpy as np
+import optuna
+import pandas as pd
+import torch as th
+import torch.nn as nn
+import zmq
+import gymnasium as gym
+from gymnasium import spaces
+from sb3_contrib import MaskablePPO
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.vec_env import DummyVecEnv
 
 
-# ----------------------------- Utility helpers -----------------------------
+# --- CONFIG ---
+DEFAULT_PORT = 5555
 
-def _utc_now() -> _dt.datetime:
-    return _dt.datetime.now(tz=_dt.timezone.utc)
+DEFAULT_CHECKPOINT_DIR = "./ai_checkpoints_v31"
+DEFAULT_STUDY_NAME = "prop_crusher_v31_asia_inverse_fvg"
+DEFAULT_STORAGE_DB = "sqlite:///v31_optuna.db"
+
+WINDOW_SIZE = 30
+BASE_FEATURES = 15
+EXTRA_TREND_SR_FEATURES = 4
+EXTRA_IFVG_ZONE_FEATURES = 3
+
+# Defaults (overridden by --pair)
+PIP_VALUE = 0.01
+SPREAD_PIPS = 1.5
+SLIPPAGE_PIPS = 0.2
+
+ASIA_START_HOUR = 0
+ASIA_END_HOUR = 8
 
 
-def _safe_float(x: Any, default: float = float("nan")) -> float:
+def _quantize_pips_0p1(v: float) -> float:
     try:
-        return float(x)
+        x = float(v)
     except Exception:
-        return default
+        return 0.0
+    if not np.isfinite(x):
+        return 0.0
+    if x <= 0.0:
+        return 0.0
+    x = max(x, 0.1)
+    return float(round(x * 10.0) / 10.0)
 
 
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
+def _rotate_log_if_schema_changed(log_path: str, expected_fieldnames: list[str]) -> None:
+    if not os.path.exists(log_path):
+        return
+
+    try:
+        with open(log_path, "r", newline="") as f:
+            first_line = f.readline().strip("\r\n")
+        expected = ",".join(expected_fieldnames)
+        if first_line == expected:
+            return
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        rotated = f"{log_path}.bak_{ts}"
+        os.rename(log_path, rotated)
+        print(f"🗂️  Rotated log due to schema change: {rotated}")
+    except Exception:
+        return
 
 
-def _today_utc_date() -> _dt.date:
-    return _utc_now().date()
-
-
-# ----------------------------- AdaptiveQualityGate -----------------------------
+def _rotate_log_if_too_big(log_path: str, *, max_mb: float) -> None:
+    if max_mb is None:
+        return
+    try:
+        max_mb_f = float(max_mb)
+    except Exception:
+        return
+    if max_mb_f <= 0.0:
+        return
+    if not os.path.exists(log_path):
+        return
+    try:
+        size_b = int(os.path.getsize(log_path))
+        max_b = int(max_mb_f * 1024 * 1024)
+        if size_b <= max_b:
+            return
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        rotated = f"{log_path}.bak_size_{ts}"
+        os.rename(log_path, rotated)
+        print(f"🗂️  Rotated log due to size ({size_b / (1024 * 1024):.1f}MB > {max_mb_f:.1f}MB): {rotated}")
+    except Exception:
+        return
 
 
 @dataclass
-class AdaptiveQualityGateStats:
-    bumps: int = 0
-    cooldown_blocks: int = 0
-    last_bump_utc: Optional[str] = None
+class _CsvSink:
+    enabled: bool
+    file: Optional[object] = None
+    writer: Optional[csv.DictWriter] = None
+    label: str = "log"
+    _warned: bool = False
+    buffer_size: int = 1000
+    flush_interval_s: float = 5.0
+    _buffer: list = field(default_factory=list)
+    _last_flush_ts: float = 0.0
 
+    def __post_init__(self) -> None:
+        self._last_flush_ts = time.time()
 
-class AdaptiveQualityGate:
-    """Simple adaptive gate.
+    def _disable_due_to_disk_full(self) -> None:
+        self.enabled = False
+        if not self._warned:
+            self._warned = True
+            print(f"⚠️  {self.label} disabled: no space left on device. Continuing without logging.")
+        try:
+            if self.file is not None:
+                self.file.close()
+        except Exception:
+            pass
+        self.file = None
+        self.writer = None
+        try:
+            self._buffer.clear()
+        except Exception:
+            pass
 
-    Designed to be compatible with prior bridge versions: if you already have an
-    AdaptiveQualityGate in the repo, feel free to replace this with an import.
-
-    Behavior:
-      - tracks recent outcomes (win/loss) and increases minimum thresholds when
-        quality deteriorates.
-      - enforces a cooldown after a bump.
-
-    The implementation is intentionally lightweight and generic.
-    """
-
-    def __init__(
-        self,
-        base_min_conf: float,
-        base_min_gap: float,
-        bump_conf: float = 0.03,
-        bump_gap: float = 0.03,
-        max_bumps: int = 5,
-        cooldown_minutes: int = 30,
-    ) -> None:
-        self.base_min_conf = base_min_conf
-        self.base_min_gap = base_min_gap
-        self.bump_conf = bump_conf
-        self.bump_gap = bump_gap
-        self.max_bumps = max_bumps
-        self.cooldown_minutes = cooldown_minutes
-
-        self._active_bumps = 0
-        self._cooldown_until: Optional[_dt.datetime] = None
-        self.stats = AdaptiveQualityGateStats()
-
-    def current_thresholds(self) -> Tuple[float, float]:
-        min_conf = self.base_min_conf + self._active_bumps * self.bump_conf
-        min_gap = self.base_min_gap + self._active_bumps * self.bump_gap
-        return min_conf, min_gap
-
-    def in_cooldown(self) -> bool:
-        if not self._cooldown_until:
-            return False
-        return _utc_now() < self._cooldown_until
-
-    def should_block_trade(self) -> bool:
-        if self.in_cooldown():
-            self.stats.cooldown_blocks += 1
-            return True
-        return False
-
-    def bump(self, reason: str = "quality") -> None:
-        if self._active_bumps >= self.max_bumps:
+    def _flush_buffer(self, *, force: bool) -> None:
+        if not self.enabled or self.writer is None or self.file is None:
             return
-        self._active_bumps += 1
-        self.stats.bumps += 1
-        now = _utc_now()
-        self.stats.last_bump_utc = now.isoformat()
-        self._cooldown_until = now + _dt.timedelta(minutes=self.cooldown_minutes)
+        if not self._buffer:
+            return
+        now = time.time()
+        if not force:
+            try:
+                if float(self.flush_interval_s) > 0.0 and (now - float(self._last_flush_ts)) < float(self.flush_interval_s):
+                    return
+            except Exception:
+                pass
+        try:
+            self.writer.writerows(self._buffer)
+            self.file.flush()
+            self._buffer.clear()
+            self._last_flush_ts = now
+        except OSError as e:
+            if getattr(e, "errno", None) in (errno.ENOSPC, 28):
+                self._disable_due_to_disk_full()
+                return
+            raise
 
-    def as_log_dict(self) -> Dict[str, Any]:
-        min_conf, min_gap = self.current_thresholds()
-        return {
-            "aqg_bumps": self.stats.bumps,
-            "aqg_cooldown_blocks": self.stats.cooldown_blocks,
-            "aqg_last_bump_utc": self.stats.last_bump_utc,
-            "aqg_active_bumps": self._active_bumps,
-            "aqg_min_conf": min_conf,
-            "aqg_min_gap": min_gap,
-            "aqg_cooldown_until": self._cooldown_until.isoformat() if self._cooldown_until else None,
-        }
+    def close(self) -> None:
+        try:
+            self._flush_buffer(force=True)
+        except Exception:
+            pass
+        try:
+            if self.file is not None:
+                self.file.close()
+        except Exception:
+            pass
+        self.file = None
+        self.writer = None
+
+    def write_row(self, row: dict) -> None:
+        if not self.enabled or self.writer is None or self.file is None:
+            return
+        try:
+            self._buffer.append(row)
+            if int(self.buffer_size) > 0 and len(self._buffer) >= int(self.buffer_size):
+                self._flush_buffer(force=True)
+            else:
+                self._flush_buffer(force=False)
+        except OSError as e:
+            if getattr(e, "errno", None) in (errno.ENOSPC, 28):
+                self._disable_due_to_disk_full()
+                return
+            raise
+        except Exception:
+            raise
 
 
-# ----------------------------- Feature builder -----------------------------
+class SupervisedMLP(nn.Module):
+    def __init__(self, input_dim: int, hidden: int = 256, layers: int = 3, dropout: float = 0.1):
+        super().__init__()
+        mods = []
+        d = int(input_dim)
+        for _ in range(int(layers)):
+            mods += [nn.Linear(d, hidden), nn.ReLU(), nn.Dropout(dropout)]
+            d = hidden
+        mods += [nn.Linear(d, 1)]
+        self.net = nn.Sequential(*mods)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        return self.net(x)
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = th.zeros(max_len, d_model)
+        position = th.arange(0, max_len, dtype=th.float).unsqueeze(1)
+        div_term = th.exp(th.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = th.sin(position * div_term)
+        pe[:, 1::2] = th.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]
+        return self.dropout(x)
+
+class SupervisedTransformer(nn.Module):
+    def __init__(self, input_dim: int, seq_len: int, d_model: int = 128, nhead: int = 4, num_layers: int = 2, dropout: float = 0.2):
+        super().__init__()
+        self.seq_len = seq_len
+        if seq_len > 0:
+            self.feat_dim = input_dim // seq_len
+        else:
+            self.feat_dim = input_dim
+        self.d_model = d_model
+        self.embedding = nn.Linear(self.feat_dim, d_model)
+        self.pos_encoder = PositionalEncoding(d_model, dropout)
+        encoder_layers = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward=d_model*2, dropout=dropout)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
+        self.decoder = nn.Linear(d_model, 1)
+
+    def forward(self, x):
+        if self.seq_len > 0:
+            x = x.view(x.size(0), self.seq_len, self.feat_dim)
+        x = x.permute(1, 0, 2)
+        x = self.embedding(x) * math.sqrt(self.d_model)
+        x = self.pos_encoder(x)
+        output = self.transformer_encoder(x)
+        last_step = output[-1, :, :]
+        return self.decoder(last_step)
+
+
+class SupervisedLSTM(nn.Module):
+    def __init__(self, input_dim: int, seq_len: int, hidden_dim: int = 128, num_layers: int = 2, dropout: float = 0.2):
+        super().__init__()
+        self.seq_len = seq_len
+        if seq_len > 0:
+            self.feat_dim = input_dim // seq_len
+        else:
+            self.feat_dim = input_dim
+        self.lstm = nn.LSTM(input_size=self.feat_dim, hidden_size=hidden_dim, num_layers=num_layers, batch_first=True, dropout=dropout)
+        self.head = nn.Sequential(nn.Linear(hidden_dim, 64), nn.ReLU(), nn.Linear(64, 1))
+
+    def forward(self, x):
+        if self.seq_len > 0:
+            x = x.view(x.size(0), self.seq_len, self.feat_dim)
+        out, (hn, cn) = self.lstm(x)
+        last_hidden = hn[-1]
+        return self.head(last_hidden)
+
+
+def _supervised_input_dim(model: Optional[nn.Module]) -> Optional[int]:
+    try:
+        if model is None:
+            return None
+        if hasattr(model, "net"):
+            first = model.net[0]
+            return int(getattr(first, "in_features"))
+        return None
+    except Exception:
+        return None
+
+
+@dataclass
+class _AdaptiveQualityGate:
+    enabled: bool
+    window_trades: int
+    loss_streak_trigger: int
+    bump_per_loss: float
+    bump_max: float
+    cooldown_bars: int
+    reset_after_bars: int = 0
+    recent_pnls: deque = None
+    loss_streak: int = 0
+    cooldown_until_bar: int = -1
+    last_trade_close_bar: int = -1
+
+    def __post_init__(self) -> None:
+        if self.recent_pnls is None:
+            self.recent_pnls = deque(maxlen=max(int(self.window_trades), 1))
+
+    def _maybe_reset_due_to_inactivity(self, *, bar_index: int) -> None:
+        if not self.enabled:
+            return
+        try:
+            reset_bars = int(self.reset_after_bars)
+        except Exception:
+            reset_bars = 0
+        if reset_bars <= 0:
+            return
+        if int(self.last_trade_close_bar) < 0:
+            return
+        try:
+            inactive = int(bar_index) - int(self.last_trade_close_bar)
+        except Exception:
+            return
+        if inactive >= reset_bars:
+            self.loss_streak = 0
+            self.cooldown_until_bar = -1
+
+    def on_trade_closed(self, pnl: float, *, bar_index: int) -> None:
+        if not self.enabled:
+            return
+        try:
+            pnl_f = float(pnl)
+        except Exception:
+            return
+        if not np.isfinite(pnl_f):
+            return
+        try:
+            self.last_trade_close_bar = int(bar_index)
+        except Exception:
+            self.last_trade_close_bar = -1
+        self.recent_pnls.append(pnl_f)
+        if pnl_f < 0.0:
+            self.loss_streak += 1
+        else:
+            self.loss_streak = 0
+        if int(self.cooldown_bars) > 0 and int(self.loss_streak_trigger) > 0:
+            if int(self.loss_streak) >= int(self.loss_streak_trigger):
+                self.cooldown_until_bar = max(int(self.cooldown_until_bar), int(bar_index) + int(self.cooldown_bars))
+
+    def in_cooldown(self, *, bar_index: int) -> bool:
+        if not self.enabled:
+            return False
+        self._maybe_reset_due_to_inactivity(bar_index=int(bar_index))
+        return int(bar_index) <= int(self.cooldown_until_bar)
+
+    def bump(self, *, bar_index: int) -> float:
+        if not self.enabled:
+            return 0.0
+        self._maybe_reset_due_to_inactivity(bar_index=int(bar_index))
+        trig = int(self.loss_streak_trigger)
+        if trig <= 0:
+            return 0.0
+        extra_losses = max(0, int(self.loss_streak) - trig + 1)
+        bump = float(extra_losses) * float(self.bump_per_loss)
+        return float(min(float(self.bump_max), max(0.0, bump)))
+
+    def recent_pf(self) -> float:
+        if not self.enabled or not self.recent_pnls:
+            return float("nan")
+        wins = 0.0
+        losses = 0.0
+        for p in self.recent_pnls:
+            if p > 0.0:
+                wins += float(p)
+            elif p < 0.0:
+                losses += -float(p)
+        if losses <= 0.0:
+            return float("inf") if wins > 0.0 else float("nan")
+        return float(wins / losses)
+
+
+def _load_supervised_model(path: str, model_type: str = "mlp", window_size: int = WINDOW_SIZE) -> tuple[nn.Module, dict]:
+    ckpt = th.load(path, map_location="cpu")
+    input_dim = int(ckpt.get("input_dim"))
+    if model_type is None:
+        model_type = ckpt.get("meta", {}).get("model_type", "mlp") if isinstance(ckpt.get("meta"), dict) else "mlp"
+
+    is_transformer = "transformer" in str(model_type).lower()
+    is_lstm = "lstm" in str(model_type).lower()
+
+    if is_transformer:
+        print(f"Loading V3 Transformer: {path}")
+        model = SupervisedTransformer(
+            input_dim=input_dim,
+            seq_len=int(window_size),
+            d_model=128,
+            nhead=4,
+            num_layers=2,
+        )
+    elif is_lstm:
+        print(f"Loading V4 LSTM: {path}")
+        model = SupervisedLSTM(
+            input_dim=input_dim,
+            seq_len=int(window_size),
+            hidden_dim=128,
+            num_layers=2
+        )
+    else:
+        model = SupervisedMLP(input_dim=input_dim)
+
+    try:
+        model.load_state_dict(ckpt.get("state_dict", ckpt), strict=True)
+    except Exception as e:
+        raise RuntimeError(f"Failed loading checkpoint {path} into {model_type}: {e!r}")
+
+    model.eval()
+    meta = ckpt.get("meta", {}) or {}
+    return model, meta
+
+
+def _safe_mtime(path: str) -> float:
+    try:
+        return float(os.path.getmtime(path))
+    except Exception:
+        return -1.0
+
+
+def _extract_tuned_threshold(meta: dict) -> Optional[float]:
+    try:
+        if not isinstance(meta, dict):
+            return None
+        t = meta.get("tuned_threshold", None)
+        if t is None:
+            return None
+        t = float(t)
+        if 0.0 < t < 1.0:
+            return t
+        return None
+    except Exception:
+        return None
+
+
+def _extract_tuned_tp_margin_pips(meta: dict) -> Optional[float]:
+    try:
+        if not isinstance(meta, dict):
+            return None
+        m = meta.get("tuned_tp_margin_pips", None)
+        if m is None:
+            return None
+        m = _quantize_pips_0p1(float(m))
+        return m if m > 0.0 else None
+    except Exception:
+        return None
+
+
+def _resolve_sup_thresholds(*, args, sup_meta: dict) -> tuple[float, float]:
+    long_overridden = args.sup_thresh_long is not None
+    short_overridden = args.sup_thresh_short is not None
+    base_long = float(args.sup_thresh_long) if long_overridden else float(args.sup_threshold)
+    base_short = float(args.sup_thresh_short) if short_overridden else float(args.sup_threshold)
+    if not bool(getattr(args, "sup_auto_threshold", False)):
+        return float(base_long), float(base_short)
+    t_long = _extract_tuned_threshold((sup_meta or {}).get("long", {}) if isinstance(sup_meta, dict) else {})
+    t_short = _extract_tuned_threshold((sup_meta or {}).get("short", {}) if isinstance(sup_meta, dict) else {})
+    if (not long_overridden) and (t_long is not None):
+        base_long = float(t_long)
+    if (not short_overridden) and (t_short is not None):
+        base_short = float(t_short)
+    return float(base_long), float(base_short)
+
+
+def _resolve_tp_margins(*, args, sup_meta: dict) -> tuple[float, float]:
+    base = _quantize_pips_0p1(getattr(args, "tp_margin_pips", 0.0))
+    long_overridden = getattr(args, "tp_margin_long_pips", None) is not None
+    short_overridden = getattr(args, "tp_margin_short_pips", None) is not None
+    base_long = _quantize_pips_0p1(float(args.tp_margin_long_pips)) if long_overridden else float(base)
+    base_short = _quantize_pips_0p1(float(args.tp_margin_short_pips)) if short_overridden else float(base)
+    if not bool(getattr(args, "sup_auto_threshold", False)):
+        return float(base_long), float(base_short)
+    m_long = _extract_tuned_tp_margin_pips((sup_meta or {}).get("long", {}) if isinstance(sup_meta, dict) else {})
+    m_short = _extract_tuned_tp_margin_pips((sup_meta or {}).get("short", {}) if isinstance(sup_meta, dict) else {})
+    if (not long_overridden) and (m_long is not None):
+        base_long = float(m_long)
+    if (not short_overridden) and (m_short is not None):
+        base_short = float(m_short)
+    return float(base_long), float(base_short)
+
+
+def _maybe_hot_reload_supervised(*, sup_long_path: str, sup_short_path: str, sup_long: Optional[nn.Module], sup_short: Optional[nn.Module], last_mtime_long: float, last_mtime_short: float, expected_input_dim: int, model_type: str = "mlp", window_size: int = WINDOW_SIZE) -> tuple[Optional[nn.Module], Optional[nn.Module], dict, float, float]:
+    m_l = _safe_mtime(sup_long_path)
+    m_s = _safe_mtime(sup_short_path)
+    changed = (m_l > last_mtime_long) or (m_s > last_mtime_short)
+    if not changed:
+        return sup_long, sup_short, {}, last_mtime_long, last_mtime_short
+    try:
+        new_long, meta_l = _load_supervised_model(str(sup_long_path), model_type=model_type, window_size=window_size)
+        new_short, meta_s = _load_supervised_model(str(sup_short_path), model_type=model_type, window_size=window_size)
+        print(f"\n🔁 Hot-reloaded supervised models: long={sup_long_path} short={sup_short_path}")
+        return new_long, new_short, {"long": meta_l, "short": meta_s}, m_l, m_s
+    except Exception as e:
+        print(f"\n⚠️  Hot-reload failed (keeping current models): {e!r}")
+        return sup_long, sup_short, {}, last_mtime_long, last_mtime_short
+
+
+def _device_for_m2_air() -> str:
+    try:
+        if th.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "mps" if th.backends.mps.is_available() else "cpu"
+
+
+class MarketTransformer(BaseFeaturesExtractor):
+    def __init__(self, observation_space: spaces.Box, features_dim: int = 128, nhead: int = 2, layers: int = 1):
+        super().__init__(observation_space, features_dim)
+        self.d_model = 32
+        n_features = observation_space.shape[0]
+        window_size = observation_space.shape[1]
+        self.embedding = nn.Linear(n_features, self.d_model)
+        self.pos_encoder = nn.Parameter(th.zeros(1, window_size, self.d_model))
+        encoder_layer = nn.TransformerEncoderLayer(d_model=self.d_model, nhead=nhead, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=layers)
+        self.linear = nn.Sequential(nn.Flatten(), nn.Linear(window_size * self.d_model, features_dim), nn.ReLU())
+
+    def forward(self, observations: th.Tensor) -> th.Tensor:
+        x = observations.permute(0, 2, 1)
+        x = self.embedding(x) + self.pos_encoder
+        x = self.transformer_encoder(x)
+        return self.linear(x)
+
+
+class BridgeEnvV31(gym.Env):
+    metadata = {"render_modes": []}
+    def __init__(self, n_features: int):
+        super().__init__()
+        self.n_features = int(n_features)
+        self.observation_space = spaces.Box(low=-20, high=20, shape=(self.n_features, WINDOW_SIZE), dtype=np.float32)
+        self.action_space = spaces.Discrete(3)
+    def reset(self, *, seed: Optional[int] = None, options=None):
+        super().reset(seed=seed)
+        return np.zeros((self.n_features, WINDOW_SIZE), dtype=np.float32), {}
+    def step(self, action):
+        return np.zeros((self.n_features, WINDOW_SIZE), dtype=np.float32), 0.0, False, False, {}
+    def valid_action_mask(self):
+        return np.array([True, True, True], dtype=bool)
+
+
+@dataclass
+class LiveParams:
+    min_gap_pips: float = 1.5
+    min_body_atr: float = 0.8
+    max_fvg_age_bars: int = 60
+    sl_buffer_atr: float = 0.25
+    min_sl_pips: float = 0.0
+    max_sl_pips: float = 0.0
+    min_tp_dist_pips: float = 0.0
+    min_rr: float = 0.0
+    min_rr_long: float = 0.0
+    min_rr_short: float = 0.0
+    tp_margin_long_pips: float = 0.0
+    tp_margin_short_pips: float = 0.0
+
+
+def load_best_params_from(*, study_name: str, storage_db: str) -> LiveParams:
+    try:
+        study = optuna.load_study(study_name=study_name, storage=storage_db)
+        bp = study.best_params
+        return LiveParams(
+            min_gap_pips=float(bp.get("min_gap_pips", 1.5)),
+            min_body_atr=float(bp.get("min_body_atr", 0.8)),
+            max_fvg_age_bars=int(bp.get("max_fvg_age_bars", 60)),
+            sl_buffer_atr=float(bp.get("sl_buffer_atr", 0.25)),
+            min_sl_pips=float(bp.get("min_sl_pips", 0.0)),
+            max_sl_pips=float(bp.get("max_sl_pips", 0.0)),
+            min_tp_dist_pips=float(bp.get("min_tp_dist_pips", 0.0)),
+            min_rr=float(bp.get("min_rr", 0.0)),
+            min_rr_long=float(bp.get("min_rr_long", 0.0)),
+            min_rr_short=float(bp.get("min_rr_short", 0.0)),
+        )
+    except Exception:
+        return LiveParams()
+
+
+class ModelManager:
+    def __init__(self, env, *, checkpoint_dir: str):
+        self.env = env
+        self.checkpoint_dir = checkpoint_dir
+        self.model: Optional[MaskablePPO] = None
+        self.current_model_path: str = ""
+        self.last_mtime: float = 0.0
+        self.load_latest_model(force=True)
+
+    def _find_latest_model(self) -> Optional[str]:
+        best_path = os.path.join(self.checkpoint_dir, "brain_best.zip")
+        if os.path.exists(best_path):
+            return best_path
+        files = glob.glob(os.path.join(self.checkpoint_dir, "model_trial_*.zip"))
+        if not files:
+            return None
+        return max(files, key=os.path.getmtime)
+
+    def load_latest_model(self, force: bool = False):
+        path = self._find_latest_model()
+        if not path:
+            return
+        mtime = os.path.getmtime(path)
+        if (not force) and path == self.current_model_path and mtime <= self.last_mtime:
+            return
+        print(f"\nReloading model: {path}...")
+        self.model = MaskablePPO.load(path, env=self.env, device=_device_for_m2_air())
+        self.current_model_path = path
+        self.last_mtime = mtime
+        print("Model loaded.")
+
+    def predict(self, obs: np.ndarray, action_mask: np.ndarray) -> int:
+        if self.model is None:
+            return 0
+        if time.time() - self.last_mtime > 60:
+            self.load_latest_model(force=False)
+        action, _ = self.model.predict(obs, deterministic=True, action_masks=action_mask)
+        if isinstance(action, np.ndarray):
+            return int(action.item())
+        return int(action)
 
 
 class LiveFeatureBuilder:
-    """Builds features/obs for supervised model and logs provenance.
-
-    Requirement (1): store exact macro_trend, vol_regime, rsi used for obs.
-    """
-
-    def __init__(self) -> None:
-        self.last_macro_trend: Optional[float] = None
-        self.last_vol_regime: Optional[float] = None
-        self.last_rsi: Optional[float] = None
-
-    def build_obs(self, raw: Dict[str, Any]) -> Any:
-        # This function depends on the rest of the codebase (data pipeline).
-        # We keep it generic: extract known keys if present.
-        self.last_macro_trend = _safe_float(raw.get("macro_trend"))
-        self.last_vol_regime = _safe_float(raw.get("vol_regime"))
-        self.last_rsi = _safe_float(raw.get("rsi"))
-
-        # Pass-through obs if already computed elsewhere.
-        return raw.get("obs", raw)
-
-
-# ----------------------------- Supervised chooser -----------------------------
-
-
-@dataclass
-class SupervisedDecision:
-    side: Optional[str]  # "long" | "short" | None
-    p_long: float
-    p_short: float
-    confidence: float
-    prob_gap: float
-    reason: str
-
-
-def _extract_model_input_dim(model: Any) -> Optional[int]:
-    """Fix (6): robustly infer input dim for mlp/transformer/lstm.
-
-    Tries common PyTorch patterns:
-      - model.input_dim
-      - model.in_features or model.fc1.in_features
-      - model.embedding.num_embeddings / embedding_dim (transformer)
-      - model.lstm.input_size (lstm)
-      - model.model.* wrappers
-    """
-
-    def get_attr(obj: Any, name: str) -> Any:
-        return getattr(obj, name, None)
-
-    # unwrap common wrapper
-    for cand in [model, get_attr(model, "model"), get_attr(model, "net"), get_attr(model, "module")]:
-        if cand is None:
-            continue
-        for name in ["input_dim", "in_dim", "n_features", "num_features"]:
-            v = get_attr(cand, name)
-            if isinstance(v, int) and v > 0:
-                return v
-        # MLP-like
-        fc1 = get_attr(cand, "fc1") or get_attr(cand, "linear1")
-        if fc1 is not None:
-            v = get_attr(fc1, "in_features")
-            if isinstance(v, int) and v > 0:
-                return v
-        v = get_attr(cand, "in_features")
-        if isinstance(v, int) and v > 0:
-            return v
-        # LSTM-like
-        lstm = get_attr(cand, "lstm")
-        if lstm is not None:
-            v = get_attr(lstm, "input_size")
-            if isinstance(v, int) and v > 0:
-                return v
-        v = get_attr(cand, "input_size")
-        if isinstance(v, int) and v > 0:
-            return v
-        # Transformer-like
-        emb = get_attr(cand, "embedding") or get_attr(cand, "emb")
-        if emb is not None:
-            v = get_attr(emb, "embedding_dim")
-            if isinstance(v, int) and v > 0:
-                return v
-
-    return None
-
-
-def supervised_choose(
-    p_long: float,
-    p_short: float,
-    *,
-    # Base thresholds
-    min_conf: float,
-    min_gap: float,
-    # Per-side overrides
-    min_conf_long: Optional[float] = None,
-    min_conf_short: Optional[float] = None,
-    min_gap_long: Optional[float] = None,
-    min_gap_short: Optional[float] = None,
-) -> SupervisedDecision:
-    """Fixes (2) and (3).
-
-    confidence: max(p_long, p_short)
-    prob_gap: abs(p_long - p_short)
-
-    A side passes if:
-      - its probability >= its min_conf
-      - AND the overall prob gap >= side min_gap (enforces separation)
-
-    If both pass, choose higher probability.
-    """
-
-    p_long = float(p_long)
-    p_short = float(p_short)
-    conf = max(p_long, p_short)
-    gap = abs(p_long - p_short)
-
-    t_conf_long = min_conf if min_conf_long is None else min_conf_long
-    t_conf_short = min_conf if min_conf_short is None else min_conf_short
-    t_gap_long = min_gap if min_gap_long is None else min_gap_long
-    t_gap_short = min_gap if min_gap_short is None else min_gap_short
-
-    long_pass = (p_long >= t_conf_long) and (gap >= t_gap_long)
-    short_pass = (p_short >= t_conf_short) and (gap >= t_gap_short)
-
-    if long_pass and short_pass:
-        side = "long" if p_long >= p_short else "short"
-        return SupervisedDecision(side, p_long, p_short, conf, gap, "both_pass_choose_higher_prob")
-
-    if long_pass:
-        return SupervisedDecision("long", p_long, p_short, conf, gap, "long_pass")
-    if short_pass:
-        return SupervisedDecision("short", p_long, p_short, conf, gap, "short_pass")
-
-    return SupervisedDecision(None, p_long, p_short, conf, gap, "no_side_pass")
-
-
-# ----------------------------- SL modes -----------------------------
-
-
-def _sl_atr(entry: float, atr: float, side: str, atr_mult: float) -> float:
-    if side == "long":
-        return entry - atr_mult * atr
-    return entry + atr_mult * atr
-
-
-def _sl_swing(
-    *,
-    side: str,
-    swing_low: Optional[float],
-    swing_high: Optional[float],
-    atr: Optional[float] = None,
-    atr_buffer_mult: float = 0.0,
-) -> Optional[float]:
-    """Fix (8): optional swing SL, disabled by default.
-
-    Long -> swing_low - buffer
-    Short -> swing_high + buffer
-    """
-
-    if side == "long":
-        if swing_low is None or math.isnan(swing_low):
-            return None
-        base = float(swing_low)
-        buf = 0.0 if atr is None else atr_buffer_mult * float(atr)
-        return base - buf
-
-    if side == "short":
-        if swing_high is None or math.isnan(swing_high):
-            return None
-        base = float(swing_high)
-        buf = 0.0 if atr is None else atr_buffer_mult * float(atr)
-        return base + buf
-
-    return None
-
-
-# ----------------------------- Trade/day limiter -----------------------------
-
-
-class TradesPerDayLimiter:
-    def __init__(self, max_trades_per_day: int) -> None:
-        self.max_trades_per_day = int(max_trades_per_day)
-        self._date = _today_utc_date()
-        self._count = 0
-
-    def can_trade(self) -> bool:
-        today = _today_utc_date()
-        if today != self._date:
-            self._date = today
-            self._count = 0
-        return self._count < self.max_trades_per_day
-
-    def on_trade(self) -> None:
-        today = _today_utc_date()
-        if today != self._date:
-            self._date = today
-            self._count = 0
-        self._count += 1
-
-    def as_log_dict(self) -> Dict[str, Any]:
-        return {"trades_today": self._count, "max_trades_per_day": self.max_trades_per_day, "trade_day": str(self._date)}
-
-
-# ----------------------------- Main bridge loop (skeleton) -----------------------------
-
-
-def parse_args(argv=None) -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-
-    # supervised thresholds
-    p.add_argument("--sup-min-confidence", type=float, default=0.55)
-    p.add_argument("--sup-min-prob-gap", type=float, default=0.05)
-    p.add_argument("--sup-min-confidence-long", type=float, default=None)
-    p.add_argument("--sup-min-confidence-short", type=float, default=None)
-    p.add_argument("--sup-min-prob-gap-long", type=float, default=None)
-    p.add_argument("--sup-min-prob-gap-short", type=float, default=None)
-
-    # adaptive quality gate
-    p.add_argument("--aqg-enabled", action="store_true")
-    p.add_argument("--aqg-bump-conf", type=float, default=0.03)
-    p.add_argument("--aqg-bump-gap", type=float, default=0.03)
-    p.add_argument("--aqg-max-bumps", type=int, default=5)
-    p.add_argument("--aqg-cooldown-minutes", type=int, default=30)
-
-    # trade limits
-    p.add_argument("--max-trades-per-day", type=int, default=999999)
-
-    # levels mode compatibility
-    p.add_argument("--levels-mode", type=str, default="asia_then_atr")
-
-    # SL modes
-    p.add_argument("--sl-mode", type=str, default="atr", choices=["atr", "swing"])
-    p.add_argument("--sl-swing-atr-buffer", type=float, default=0.0)
-
-    # misc
-    p.add_argument("--log-json", action="store_true")
-
-    return p.parse_args(argv)
-
-
-def _log(d: Dict[str, Any], json_mode: bool = False) -> None:
-    if json_mode:
-        print(json.dumps(d, default=str), flush=True)
-    else:
-        print(" | ".join(f"{k}={v}" for k, v in d.items()), flush=True)
-
-
-def main(argv=None) -> int:
-    args = parse_args(argv)
-
-    feature_builder = LiveFeatureBuilder()
-    limiter = TradesPerDayLimiter(args.max_trades_per_day)
-
-    aqg = None
-    if args.aqg_enabled:
-        aqg = AdaptiveQualityGate(
-            base_min_conf=args.sup_min_confidence,
-            base_min_gap=args.sup_min_prob_gap,
-            bump_conf=args.aqg_bump_conf,
-            bump_gap=args.aqg_bump_gap,
-            max_bumps=args.aqg_max_bumps,
-            cooldown_minutes=args.aqg_cooldown_minutes,
-        )
-
-    # The actual repo likely has its own market data loop/exchange bridge.
-    # We keep a skeleton here that illustrates how changes are wired.
-    while True:
-        # --- fetch raw state/obs from elsewhere ---
-        raw = {
-            # placeholders; your live pipeline should provide these
-            "macro_trend": 0.0,
-            "vol_regime": 0.0,
-            "rsi": 50.0,
-            # probabilities from supervised model
-            "p_long": 0.5,
-            "p_short": 0.5,
-            # prices/vol
-            "entry": 100.0,
-            "atr": 1.0,
-            "swing_low": 98.0,
-            "swing_high": 102.0,
-        }
-
-        obs = feature_builder.build_obs(raw)
-        _ = obs  # in the real system, pass obs to model
-
-        # thresholds possibly bumped by AQG
-        min_conf = args.sup_min_confidence
-        min_gap = args.sup_min_prob_gap
-        if aqg is not None:
-            min_conf, min_gap = aqg.current_thresholds()
-
-        decision = supervised_choose(
-            raw["p_long"],
-            raw["p_short"],
-            min_conf=min_conf,
-            min_gap=min_gap,
-            min_conf_long=args.sup_min_confidence_long,
-            min_conf_short=args.sup_min_confidence_short,
-            min_gap_long=args.sup_min_prob_gap_long,
-            min_gap_short=args.sup_min_prob_gap_short,
-        )
-
-        log_row = {
-            "ts": _utc_now().isoformat(),
-            "macro_trend": feature_builder.last_macro_trend,
-            "vol_regime": feature_builder.last_vol_regime,
-            "rsi": feature_builder.last_rsi,
-            "p_long": decision.p_long,
-            "p_short": decision.p_short,
-            "sup_conf": decision.confidence,
-            "sup_gap": decision.prob_gap,
-            "sup_decision": decision.side,
-            "sup_reason": decision.reason,
-            **limiter.as_log_dict(),
-        }
-        if aqg is not None:
-            log_row.update(aqg.as_log_dict())
-
-        # enforce AQG cooldown
-        if aqg is not None and aqg.should_block_trade():
-            log_row["trade_allowed"] = False
-            log_row["block_reason"] = "aqg_cooldown"
-            _log(log_row, args.log_json)
-            time.sleep(1)
-            continue
-
-        # enforce max trades/day (5)
-        if not limiter.can_trade():
-            log_row["trade_allowed"] = False
-            log_row["block_reason"] = "max_trades_per_day"
-            _log(log_row, args.log_json)
-            time.sleep(1)
-            continue
-
-        if decision.side is None:
-            log_row["trade_allowed"] = False
-            log_row["block_reason"] = "no_signal"
-            _log(log_row, args.log_json)
-            time.sleep(1)
-            continue
-
-        # compute SL
-        entry = float(raw["entry"])
-        atr = float(raw["atr"])
-        if args.sl_mode == "atr":
-            sl = _sl_atr(entry, atr, decision.side, atr_mult=1.5)
+    def __init__(self, window_size: int, params: LiveParams, *, trade_start_hour: int, trade_end_hour: int, asia_start_hour: int, asia_end_hour: int, include_trend_sr: bool, include_ifvg_zone_features: bool, use_ifvg_inversion_logic: bool, ifvg_retest_near_atr: Optional[float] = None, atr_min_pips: float = 0.0, atr_max_pips: float = 0.0, trend_lookback: int = 50, sr_lookback: int = 288, structure_window: int = 24, trend_slope_short_max: Optional[float] = None, trend_slope_long_min: Optional[float] = None, trend_slope_min_abs: Optional[float] = None, day_trend_filter: bool = False, day_trend_lookback: int = 240, day_trend_threshold: float = 0.0, day_trend_min_hour: int = 0, require_day_trend_for_longs: bool = False, require_day_trend_for_shorts: bool = False, levels_mode: str = "asia", atr_sl_mult: float = 1.0, atr_rr: float = 1.4):
+        self.window_size = window_size
+        self.params = params
+        self.trade_start_hour = int(trade_start_hour)
+        self.trade_end_hour = int(trade_end_hour)
+        self.asia_start_hour = int(asia_start_hour)
+        self.asia_end_hour = int(asia_end_hour)
+        self.include_trend_sr = bool(include_trend_sr)
+        self.include_ifvg_zone_features = bool(include_ifvg_zone_features)
+        self.use_ifvg_inversion_logic = bool(use_ifvg_inversion_logic)
+        self.ifvg_retest_near_atr = float(ifvg_retest_near_atr) if (ifvg_retest_near_atr is not None) else 0.25
+        self.atr_min_pips = float(atr_min_pips or 0.0)
+        self.atr_max_pips = float(atr_max_pips or 0.0)
+        self.trend_lookback = int(trend_lookback)
+        self.sr_lookback = int(sr_lookback)
+        self.structure_window = int(structure_window)
+        self.trend_slope_short_max = float(trend_slope_short_max) if trend_slope_short_max is not None else None
+        self.trend_slope_long_min = float(trend_slope_long_min) if trend_slope_long_min is not None else None
+        self.trend_slope_min_abs = float(trend_slope_min_abs) if trend_slope_min_abs is not None else None
+        self.day_trend_filter = bool(day_trend_filter)
+        self.day_trend_lookback = int(day_trend_lookback)
+        self.day_trend_threshold = float(day_trend_threshold or 0.0)
+        self.day_trend_min_hour = int(day_trend_min_hour)
+        self.require_day_trend_for_longs = bool(require_day_trend_for_longs)
+        self.require_day_trend_for_shorts = bool(require_day_trend_for_shorts)
+        self.levels_mode = str(levels_mode or "asia").strip().lower()
+        if self.levels_mode not in ("asia", "atr", "asia_then_atr"):
+            self.levels_mode = "asia"
+        self.atr_sl_mult = float(atr_sl_mult or 1.0)
+        self.atr_rr = float(atr_rr or 1.4)
+        self.last_atr_pips: float = float("nan")
+        self.atr_ok: bool = True
+        self.last_trend_slope_atr: float = 0.0
+        self.day_trend_bias: int = 0
+        self.day_trend_is_set: bool = False
+        self.day_trend_slope_atr: float = float("nan")
+        self.last_day_trend_block_long: bool = False
+        self.last_day_trend_block_short: bool = False
+        self.last_day_trend_req_block_long: bool = False
+        self.last_day_trend_req_block_short: bool = False
+        self._max_history = int(max(60, self.window_size + 2, self.trend_lookback, self.sr_lookback, self.day_trend_lookback, 2 * self.structure_window) + 5)
+        self.history = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume", "Corr_Close", "Hour"])
+        self._last_hour: Optional[int] = None
+        self._day_id: int = 0
+        self._bar_in_day: int = 0
+        self._global_bar_index: int = 0
+        self.asia_high: float = np.nan
+        self.asia_low: float = np.nan
+        self.day_bias: int = 0
+        self._bull_bottom = np.nan
+        self._bull_top = np.nan
+        self._bull_age = 0
+        self._bear_bottom = np.nan
+        self._bear_top = np.nan
+        self._bear_age = 0
+        self._inv_bull_bottom = np.nan
+        self._inv_bull_top = np.nan
+        self._inv_bull_age = 0
+        self._inv_bear_bottom = np.nan
+        self._inv_bear_top = np.nan
+        self._inv_bear_age = 0
+
+    def _new_day_if_needed(self, hour: int):
+        if self._last_hour is None:
+            self._last_hour = hour
+            return
+        if hour < self._last_hour:
+            self._day_id += 1
+            self._bar_in_day = 0
+            self.asia_high = np.nan
+            self.asia_low = np.nan
+            self.day_bias = 0
+            self.day_trend_bias = 0
+            self.day_trend_is_set = False
+            self.day_trend_slope_atr = float("nan")
+            self.last_day_trend_block_long = False
+            self.last_day_trend_block_short = False
+            self.last_day_trend_req_block_long = False
+            self.last_day_trend_req_block_short = False
+            self._bull_bottom = np.nan
+            self._bull_top = np.nan
+            self._bull_age = 0
+            self._bear_bottom = np.nan
+            self._bear_top = np.nan
+            self._bear_age = 0
+            self._inv_bull_bottom = np.nan
+            self._inv_bull_top = np.nan
+            self._inv_bull_age = 0
+            self._inv_bear_bottom = np.nan
+            self._inv_bear_top = np.nan
+            self._inv_bear_age = 0
+        self._last_hour = hour
+
+    def add_bar(self, row: dict):
+        hour = int(row.get("Hour", 0))
+        self._new_day_if_needed(hour)
+        self._bar_in_day += 1
+        self._global_bar_index += 1
+        self.history.loc[len(self.history)] = row
+        if len(self.history) > int(self._max_history):
+            self.history = self.history.iloc[-int(self._max_history) :].reset_index(drop=True)
+        if self.asia_start_hour <= hour < self.asia_end_hour:
+            hi = float(row["High"])
+            lo = float(row["Low"])
+            self.asia_high = hi if not np.isfinite(self.asia_high) else max(self.asia_high, hi)
+            self.asia_low = lo if not np.isfinite(self.asia_low) else min(self.asia_low, lo)
+        if hour >= self.asia_end_hour and self.day_bias == 0 and np.isfinite(self.asia_high) and np.isfinite(self.asia_low):
+            hi = float(row["High"])
+            lo = float(row["Low"])
+            cl = float(row["Close"])
+            bear = (hi >= self.asia_high) and (cl < self.asia_high)
+            bull = (lo <= self.asia_low) and (cl > self.asia_low)
+            if bear:
+                self.day_bias = -1
+            elif bull:
+                self.day_bias = 1
+        self._update_fvg_state()
+
+    def _compute_atr_series(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        high = df["High"].astype(float)
+        low = df["Low"].astype(float)
+        close = df["Close"].astype(float)
+        prev_close = close.shift(1)
+        tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+        return tr.rolling(period).mean().bfill().fillna(tr.mean())
+
+    def _update_fvg_state(self):
+        df = self.history
+        n = len(df)
+        if n < 3:
+            return
+        if np.isfinite(self._bull_bottom):
+            self._bull_age += 1
+            if self._bull_age > int(self.params.max_fvg_age_bars):
+                self._bull_bottom = np.nan
+                self._bull_top = np.nan
+                self._bull_age = 0
+        if np.isfinite(self._bear_bottom):
+            self._bear_age += 1
+            if self._bear_age > int(self.params.max_fvg_age_bars):
+                self._bear_bottom = np.nan
+                self._bear_top = np.nan
+                self._bear_age = 0
+        if np.isfinite(self._inv_bull_bottom):
+            self._inv_bull_age += 1
+            if self._inv_bull_age > int(self.params.max_fvg_age_bars):
+                self._inv_bull_bottom = np.nan
+                self._inv_bull_top = np.nan
+                self._inv_bull_age = 0
+        if np.isfinite(self._inv_bear_bottom):
+            self._inv_bear_age += 1
+            if self._inv_bear_age > int(self.params.max_fvg_age_bars):
+                self._inv_bear_bottom = np.nan
+                self._inv_bear_top = np.nan
+                self._inv_bear_age = 0
+        atr = self._compute_atr_series(df).values
+        i = n - 1
+        body = abs(float(df.loc[i - 1, "Close"]) - float(df.loc[i - 1, "Open"]))
+        atr_i = float(max(float(atr[i - 1]), 1e-6))
+        min_gap = float(self.params.min_gap_pips) * PIP_VALUE
+        hi_i2 = float(df.loc[i - 2, "High"])
+        lo_i2 = float(df.loc[i - 2, "Low"])
+        hi_i = float(df.loc[i, "High"])
+        lo_i = float(df.loc[i, "Low"])
+        if (hi_i2 < lo_i) and ((lo_i - hi_i2) >= min_gap) and (body >= float(self.params.min_body_atr) * atr_i):
+            self._bull_bottom = hi_i2
+            self._bull_top = lo_i
+            self._bull_age = 0
+        if (lo_i2 > hi_i) and ((lo_i2 - hi_i) >= min_gap) and (body >= float(self.params.min_body_atr) * atr_i):
+            self._bear_bottom = hi_i
+            self._bear_top = lo_i2
+            self._bear_age = 0
+        if np.isfinite(self._bull_bottom) and (lo_i <= float(self._bull_bottom)):
+            self._inv_bull_bottom = float(self._bull_bottom)
+            self._inv_bull_top = float(self._bull_top)
+            self._inv_bull_age = 0
+            self._bull_bottom = np.nan
+            self._bull_top = np.nan
+            self._bull_age = 0
+        if np.isfinite(self._bear_top) and (hi_i >= float(self._bear_top)):
+            self._inv_bear_bottom = float(self._bear_bottom)
+            self._inv_bear_top = float(self._bear_top)
+            self._inv_bear_age = 0
+            self._bear_bottom = np.nan
+            self._bear_top = np.nan
+            self._bear_age = 0
+        if np.isfinite(self._bull_bottom) and lo_i <= self._bull_bottom:
+            self._bull_bottom = np.nan
+            self._bull_top = np.nan
+            self._bull_age = 0
+        if np.isfinite(self._bear_top) and hi_i >= self._bear_top:
+            self._bear_bottom = np.nan
+            self._bear_top = np.nan
+            self._bear_age = 0
+
+    def _corr_series(self, close: pd.Series, corr_close: pd.Series) -> pd.Series:
+        try:
+            return close.rolling(50).corr(corr_close).fillna(0.0)
+        except Exception:
+            return pd.Series(np.zeros(len(close), dtype=np.float32))
+
+    def get_obs_and_mask(self) -> Tuple[Optional[np.ndarray], np.ndarray]:
+        df = self.history.copy()
+        if len(df) < max(60, self.window_size + 2):
+            self.last_atr_pips = float("nan")
+            self.atr_ok = True
+            return None, np.array([[True, False, False]], dtype=bool)
+        df["Open"] = df["Open"].replace(0, 1e-5).astype(float)
+        df["Close"] = df["Close"].astype(float)
+        df["High"] = df["High"].astype(float)
+        df["Low"] = df["Low"].astype(float)
+        df["Volume"] = df["Volume"].astype(float)
+        if "Corr_Close" not in df.columns:
+            df["Corr_Close"] = 0.0
+        df["Corr_Close"] = df["Corr_Close"].astype(float).fillna(0.0)
+        minutes = float((self._bar_in_day - 1) * 5 % 1440)
+        angle = 2 * np.pi * (minutes / 1440.0)
+        tod_sin = float(np.sin(angle))
+        tod_cos = float(np.cos(angle))
+        dow = 0.0
+        df["Corr"] = self._corr_series(df["Close"], df["Corr_Close"])
+        atr = self._compute_atr_series(df)
+        prev_close = df["Close"].shift(1).replace(0, np.nan)
+        df["Rel_Open"] = (((df["Open"] - prev_close) / prev_close) * 1000).fillna(0.0)
+        df["Rel_High"] = ((df["High"] - df["Open"]) / df["Open"]) * 1000
+        df["Rel_Low"] = ((df["Low"] - df["Open"]) / df["Open"]) * 1000
+        df["Rel_Close"] = ((df["Close"] - df["Open"]) / df["Open"]) * 1000
+        vol_ma = df["Volume"].rolling(50).mean().replace(0, 1.0)
+        df["Rel_Vol"] = (df["Volume"] / vol_ma).fillna(0.0)
+        df["Rel_Corr"] = df["Corr"].fillna(0.0)
+        clip_cols = ["Rel_Open", "Rel_High", "Rel_Low", "Rel_Close", "Rel_Vol", "Rel_Corr"]
+        df[clip_cols] = df[clip_cols].clip(-20.0, 20.0)
+        last_close = float(df["Close"].iloc[-1])
+        last_atr = float(max(float(atr.iloc[-1]), 1e-6))
+        try:
+            self.last_atr_pips = float(last_atr / float(max(PIP_VALUE, 1e-9)))
+        except Exception:
+            self.last_atr_pips = float("nan")
+        atr_ok = True
+        if float(self.atr_min_pips) > 0.0 and np.isfinite(self.last_atr_pips):
+            atr_ok = atr_ok and (self.last_atr_pips >= float(self.atr_min_pips))
+        if float(self.atr_max_pips) > 0.0 and np.isfinite(self.last_atr_pips):
+            atr_ok = atr_ok and (self.last_atr_pips <= float(self.atr_max_pips))
+        self.atr_ok = bool(atr_ok)
+        ah = float(self.asia_high) if np.isfinite(self.asia_high) else 0.0
+        al = float(self.asia_low) if np.isfinite(self.asia_low) else 0.0
+        dist_to_asia_high_atr = float(((ah - last_close) / last_atr)) if np.isfinite(self.asia_high) else 0.0
+        dist_to_asia_low_atr = float(((last_close - al) / last_atr)) if np.isfinite(self.asia_low) else 0.0
+        dist_to_asia_high_atr = float(np.clip(dist_to_asia_high_atr, -10.0, 10.0))
+        dist_to_asia_low_atr = float(np.clip(dist_to_asia_low_atr, -10.0, 10.0))
+        hour = int(df["Hour"].iloc[-1]) if "Hour" in df.columns else 0
+        window = df.iloc[-self.window_size :].copy()
+        
+        # --- NEW V5 CONTEXT FEATURES ---
+        lookback_4h = 48
+        macro_trend = 0.0
+        if len(df) >= lookback_4h:
+            y_reg = df["Close"].iloc[-lookback_4h:].values.astype(float)
+            x_reg = np.arange(len(y_reg))
+            slope, _ = np.polyfit(x_reg, y_reg, 1)
+            macro_trend = (slope / last_atr) * 10.0
+
+        long_term_atr_series = self._compute_atr_series(df, period=288)
+        long_term_atr = float(long_term_atr_series.iloc[-1])
+        if np.isnan(long_term_atr) or long_term_atr == 0:
+            vol_regime = 1.0
         else:
-            sl = _sl_swing(
-                side=decision.side,
-                swing_low=_safe_float(raw.get("swing_low")),
-                swing_high=_safe_float(raw.get("swing_high")),
-                atr=_safe_float(raw.get("atr")),
-                atr_buffer_mult=args.sl_swing_atr_buffer,
-            )
-            # If swing not available, fall back to ATR to avoid changing behavior unexpectedly.
-            if sl is None:
-                sl = _sl_atr(entry, atr, decision.side, atr_mult=1.5)
+            vol_regime = last_atr / long_term_atr
 
-        # levels-mode compatibility (7): keep asia_then_atr as default behavior.
-        levels_mode = (args.levels_mode or "").strip().lower()
-        log_row["levels_mode"] = levels_mode
-        log_row["sl_mode"] = args.sl_mode
-        log_row["sl"] = sl
+        rsi_val = 0.0
+        try:
+            delta = df["Close"].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            rs = gain / loss.replace(0, 1e-9)
+            rsi = 100 - (100 / (1 + rs))
+            rsi_val = (float(rsi.iloc[-1]) - 50.0) / 50.0
+            if np.isnan(rsi_val): rsi_val = 0.0
+        except:
+            pass
 
-        # place trade (placeholder)
-        limiter.on_trade()
-        log_row["trade_allowed"] = True
-        log_row["action"] = f"place_{decision.side}"
-        _log(log_row, args.log_json)
+        window["macro_trend"] = float(np.clip(macro_trend, -10, 10))
+        window["vol_regime"] = float(np.clip(vol_regime, -5, 5))
+        window["rsi"] = float(np.clip(rsi_val, -1, 1))
+        
+        window["tod_sin"] = tod_sin
+        window["tod_cos"] = tod_cos
+        window["dow"] = dow
+        window["dist_to_asia_high_atr"] = dist_to_asia_high_atr
+        window["dist_to_asia_low_atr"] = dist_to_asia_low_atr
+        window["asia_bias"] = float(self.day_bias)
+        
+        if self.include_ifvg_zone_features:
+            z_bot = np.nan
+            z_top = np.nan
+            if self.day_bias == 1 and np.isfinite(self._inv_bear_bottom):
+                z_bot = float(self._inv_bear_bottom)
+                z_top = float(self._inv_bear_top)
+            elif self.day_bias == -1 and np.isfinite(self._inv_bull_bottom):
+                z_bot = float(self._inv_bull_bottom)
+                z_top = float(self._inv_bull_top)
+            if np.isfinite(z_bot) and np.isfinite(z_top):
+                hi = float(df["High"].iloc[-1])
+                lo = float(df["Low"].iloc[-1])
+                cl = float(df["Close"].iloc[-1])
+                in_zone = (lo <= z_top) and (hi >= z_bot)
+                window["ifvg_dist_to_top_atr"] = float(np.clip((z_top - cl) / last_atr, -10.0, 10.0))
+                window["ifvg_dist_to_bottom_atr"] = float(np.clip((cl - z_bot) / last_atr, -10.0, 10.0))
+                window["ifvg_in_zone"] = 1.0 if in_zone else 0.0
+            else:
+                window["ifvg_dist_to_top_atr"] = 0.0
+                window["ifvg_dist_to_bottom_atr"] = 0.0
+                window["ifvg_in_zone"] = 0.0
+        
+        if self.include_trend_sr:
+            lb = int(max(10, self.trend_lookback))
+            if len(df) >= lb:
+                y = df["Close"].iloc[-lb:].astype(float).values
+                x = np.arange(lb, dtype=np.float32)
+                x = x - x.mean()
+                y = y - float(np.mean(y))
+                denom = float(np.dot(x, x))
+                slope = float(np.dot(x, y) / denom) if denom > 1e-9 else 0.0
+                trend_slope_atr = float(np.clip(slope / last_atr, -10.0, 10.0))
+            else:
+                trend_slope_atr = 0.0
+            self.last_trend_slope_atr = float(trend_slope_atr)
+            sr_lb = int(max(20, self.sr_lookback))
+            if len(df) >= sr_lb:
+                sr_hi = float(df["High"].iloc[-sr_lb:].max())
+                sr_lo = float(df["Low"].iloc[-sr_lb:].min())
+                dist_to_sr_high_atr = float(np.clip(((sr_hi - last_close) / last_atr), -10.0, 10.0))
+                dist_to_sr_low_atr = float(np.clip(((last_close - sr_lo) / last_atr), -10.0, 10.0))
+            else:
+                dist_to_sr_high_atr = 0.0
+                dist_to_sr_low_atr = 0.0
+            w = int(max(10, self.structure_window))
+            if len(df) >= 2 * w:
+                recent_hi = float(df["High"].iloc[-w:].max())
+                recent_lo = float(df["Low"].iloc[-w:].min())
+                prior_hi = float(df["High"].iloc[-2 * w : -w].max())
+                prior_lo = float(df["Low"].iloc[-2 * w : -w].min())
+                bull = (recent_hi > prior_hi) and (recent_lo > prior_lo)
+                bear = (recent_hi < prior_hi) and (recent_lo < prior_lo)
+                structure = float((1 if bull else 0) - (1 if bear else 0))
+            else:
+                structure = 0.0
+            window["trend_slope_atr"] = trend_slope_atr
+            window["structure"] = structure
+            window["dist_to_sr_high_atr"] = dist_to_sr_high_atr
+            window["dist_to_sr_low_atr"] = dist_to_sr_low_atr
+        
+        if self.day_trend_filter and (not bool(self.day_trend_is_set)):
+            lb_day = int(max(20, self.day_trend_lookback))
+            if (hour >= int(self.day_trend_min_hour)) and (len(df) >= lb_day) and np.isfinite(last_atr):
+                y = df["Close"].iloc[-lb_day:].astype(float).values
+                x = np.arange(lb_day, dtype=np.float32)
+                x = x - x.mean()
+                y = y - float(np.mean(y))
+                denom = float(np.dot(x, x))
+                slope = float(np.dot(x, y) / denom) if denom > 1e-9 else 0.0
+                slope_atr = float(np.clip(slope / float(max(last_atr, 1e-6)), -10.0, 10.0))
+                self.day_trend_slope_atr = float(slope_atr)
+                th_val = float(self.day_trend_threshold)
+                if th_val > 0.0:
+                    if float(slope_atr) >= float(th_val):
+                        self.day_trend_bias = 1
+                        self.day_trend_is_set = True
+                    elif float(slope_atr) <= -float(th_val):
+                        self.day_trend_bias = -1
+                        self.day_trend_is_set = True
+        
+        feature_cols = [
+            "Rel_Open", "Rel_High", "Rel_Low", "Rel_Close", "Rel_Vol", "Rel_Corr",
+            "tod_sin", "tod_cos", "dow",
+            "dist_to_asia_high_atr", "dist_to_asia_low_atr", "asia_bias",
+            "macro_trend", "vol_regime", "rsi"
+        ]
+        if self.include_trend_sr:
+            feature_cols += ["trend_slope_atr", "structure", "dist_to_sr_high_atr", "dist_to_sr_low_atr"]
+        if self.include_ifvg_zone_features:
+            feature_cols += ["ifvg_dist_to_top_atr", "ifvg_dist_to_bottom_atr", "ifvg_in_zone"]
+        x = window[feature_cols].values.T.astype(np.float32)
+        obs = np.expand_dims(x, axis=0)
+        allow_long = False
+        allow_short = False
+        hi = float(df["High"].iloc[-1])
+        lo = float(df["Low"].iloc[-1])
+        cl = float(df["Close"].iloc[-1])
+        if self.use_ifvg_inversion_logic:
+            if self.day_bias == 1 and np.isfinite(self._inv_bear_bottom):
+                z_bot = float(self._inv_bear_bottom)
+                z_top = float(self._inv_bear_top)
+                in_zone = (lo <= z_top) and (hi >= z_bot)
+                near_atr = float(getattr(self, "ifvg_retest_near_atr", 0.25))
+                dist_edge = min(abs(cl - z_bot), abs(cl - z_top)) / float(max(last_atr, 1e-6))
+                allow_long = bool(in_zone or (dist_edge <= near_atr))
+            if self.day_bias == -1 and np.isfinite(self._inv_bull_bottom):
+                z_bot = float(self._inv_bull_bottom)
+                z_top = float(self._inv_bull_top)
+                in_zone = (lo <= z_top) and (hi >= z_bot)
+                near_atr = float(getattr(self, "ifvg_retest_near_atr", 0.25))
+                dist_edge = min(abs(cl - z_bot), abs(cl - z_top)) / float(max(last_atr, 1e-6))
+                allow_short = bool(in_zone or (dist_edge <= near_atr))
+        else:
+            if self.day_bias == 1 and np.isfinite(self._bull_bottom):
+                allow_long = (lo <= float(self._bull_top)) and (hi >= float(self._bull_bottom))
+            if self.day_bias == -1 and np.isfinite(self._bear_bottom):
+                allow_short = (hi >= float(self._bear_bottom)) and (lo <= float(self._bear_top))
+        if self.trade_start_hour == self.trade_end_hour:
+            in_time = True
+        elif self.trade_start_hour < self.trade_end_hour:
+            in_time = (hour >= self.trade_start_hour) and (hour < self.trade_end_hour)
+        else:
+            in_time = (hour >= self.trade_start_hour) or (hour < self.trade_end_hour)
+        allow_long = bool(allow_long and self.atr_ok)
+        allow_short = bool(allow_short and self.atr_ok)
+        if self.include_trend_sr and np.isfinite(self.last_trend_slope_atr):
+            if self.trend_slope_short_max is not None:
+                allow_short = bool(allow_short and (float(self.last_trend_slope_atr) <= float(self.trend_slope_short_max)))
+            if self.trend_slope_long_min is not None:
+                allow_long = bool(allow_long and (float(self.last_trend_slope_atr) >= float(self.trend_slope_long_min)))
+            if self.trend_slope_min_abs is not None and np.isfinite(self.trend_slope_min_abs):
+                min_abs = float(self.trend_slope_min_abs)
+                if min_abs > 0.0:
+                    ok = bool(abs(float(self.last_trend_slope_atr)) >= min_abs)
+                    allow_long = bool(allow_long and ok)
+                    allow_short = bool(allow_short and ok)
+        self.last_day_trend_req_block_long = False
+        self.last_day_trend_req_block_short = False
+        if self.day_trend_filter:
+            if self.require_day_trend_for_longs and int(self.day_trend_bias) != 1:
+                if bool(allow_long):
+                    self.last_day_trend_req_block_long = True
+                allow_long = False
+            if self.require_day_trend_for_shorts and int(self.day_trend_bias) != -1:
+                if bool(allow_short):
+                    self.last_day_trend_req_block_short = True
+                allow_short = False
+        self.last_day_trend_block_long = False
+        self.last_day_trend_block_short = False
+        if self.day_trend_filter and int(self.day_trend_bias) != 0:
+            if int(self.day_trend_bias) > 0:
+                if bool(allow_short):
+                    self.last_day_trend_block_short = True
+                allow_short = False
+            elif int(self.day_trend_bias) < 0:
+                if bool(allow_long):
+                    self.last_day_trend_block_long = True
+                allow_long = False
+        mask = np.array([[True, bool(in_time and allow_long), bool(in_time and allow_short)]], dtype=bool)
+        return obs, mask
 
-        # sleep in this skeleton
-        time.sleep(1)
+    def get_trade_levels(self, action: int) -> Optional[Tuple[float, float, float]]:
+        if len(self.history) < 20: return None
+        close = float(self.history["Close"].iloc[-1])
+        hour = int(self.history["Hour"].iloc[-1])
+        df = self.history.copy()
+        atr = self._compute_atr_series(df)
+        last_atr = float(max(float(atr.iloc[-1]), 1e-6))
+        spread = SPREAD_PIPS * PIP_VALUE
+        slippage = SLIPPAGE_PIPS * PIP_VALUE
+        sl_buf = float(self.params.sl_buffer_atr) * last_atr
+        margin_pips = 0.0
+        if action == 1: margin_pips = _quantize_pips_0p1(getattr(self.params, "tp_margin_long_pips", 0.0))
+        elif action == 2: margin_pips = _quantize_pips_0p1(getattr(self.params, "tp_margin_short_pips", 0.0))
+        tp_margin = float(margin_pips) * PIP_VALUE
+        
+        mode = self.levels_mode
+        def _atr_levels(act):
+            risk_dist = self.atr_sl_mult * last_atr
+            if act == 1:
+                entry = close + spread/2 + slippage
+                sl = entry - risk_dist
+                tp = entry + self.atr_rr * risk_dist
+                return entry, sl, tp
+            elif act == 2:
+                entry = close - spread/2 - slippage
+                sl = entry + risk_dist
+                tp = entry - self.atr_rr * risk_dist
+                return entry, sl, tp
+            return None
 
+        if mode == "atr": return _atr_levels(action)
+        if not (np.isfinite(self.asia_high) and np.isfinite(self.asia_low)):
+             return _atr_levels(action) if mode == "asia_then_atr" else None
+        if hour < self.asia_end_hour:
+             return _atr_levels(action) if mode == "asia_then_atr" else None
+
+        if action == 1:
+            entry = close + spread/2 + slippage
+            tp = float(self.asia_high) - spread/2 - tp_margin
+            sl = float(self.asia_low) - sl_buf - spread/2
+            if not (tp > entry and sl < entry): return _atr_levels(action) if mode == "asia_then_atr" else None
+            return entry, sl, tp
+        if action == 2:
+            entry = close - spread/2 - slippage
+            tp = float(self.asia_low) + spread/2 + tp_margin
+            sl = float(self.asia_high) + sl_buf + spread/2
+            if not (tp < entry and sl > entry): return _atr_levels(action) if mode == "asia_then_atr" else None
+            return entry, sl, tp
+        return None
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pair", choices=["eurjpy", "eurusd"], default="eurjpy")
+    parser.add_argument("--checkpoint-dir", default=DEFAULT_CHECKPOINT_DIR)
+    parser.add_argument("--study-name", default=DEFAULT_STUDY_NAME)
+    parser.add_argument("--storage-db", default=DEFAULT_STORAGE_DB)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--hour-offset", type=int, default=0)
+    parser.add_argument("--asia-start-hour", type=int, default=ASIA_START_HOUR)
+    parser.add_argument("--asia-end-hour", type=int, default=ASIA_END_HOUR)
+    parser.add_argument("--trade-start-hour", type=int, default=8)
+    parser.add_argument("--trade-end-hour", type=int, default=16)
+    parser.add_argument("--pip-value", type=float, default=0.0)
+    parser.add_argument("--min-gap-pips", type=float, default=None)
+    parser.add_argument("--min-body-atr", type=float, default=None)
+    parser.add_argument("--max-fvg-age-bars", type=int, default=None)
+    parser.add_argument("--sl-buffer-atr", type=float, default=None)
+    parser.add_argument("--min-sl-pips", type=float, default=None)
+    parser.add_argument("--max-sl-pips", type=float, default=None)
+    parser.add_argument("--min-tp_dist_pips", type=float, default=None)
+    parser.add_argument("--min-rr", type=float, default=None)
+    parser.add_argument("--min-rr-long", type=float, default=None)
+    parser.add_argument("--min-rr-short", type=float, default=None)
+    parser.add_argument("--tp-margin-pips", type=float, default=0.0)
+    parser.add_argument("--tp-margin-long-pips", type=float, default=None)
+    parser.add_argument("--tp-margin-short-pips", type=float, default=None)
+    parser.add_argument("--levels-mode", choices=["asia", "atr", "asia_then_atr"], default="asia")
+    parser.add_argument("--model-type", default="mlp", choices=["mlp", "transformer", "lstm"])
+    parser.add_argument("--atr-sl-mult", type=float, default=1.0)
+    parser.add_argument("--atr-rr", type=float, default=1.4)
+    parser.add_argument("--min-atr-pips", type=float, default=0.0)
+    parser.add_argument("--max-atr-pips", type=float, default=0.0)
+    parser.add_argument("--trend-sr", action="store_true")
+    parser.add_argument("--trend-slope-short-max", type=float, default=None)
+    parser.add_argument("--trend-slope-long-min", type=float, default=None)
+    parser.add_argument("--trend-slope-min-abs", type=float, default=None)
+    parser.add_argument("--day-trend-filter", action="store_true")
+    parser.add_argument("--day-trend-lookback", type=int, default=240)
+    parser.add_argument("--day-trend-threshold", type=float, default=0.12)
+    parser.add_argument("--day-trend-min-hour", type=int, default=0)
+    parser.add_argument("--require-day-trend-for-longs", action="store_true")
+    parser.add_argument("--require-day-trend-for-shorts", action="store_true")
+    parser.add_argument("--mode", choices=["rl", "supervised"], default="rl")
+    parser.add_argument("--ifvg-zone-features", action="store_true")
+    parser.add_argument("--sup-long", default="./ai_supervised_v1/sup_long_eurusd_trendsr.pt")
+    parser.add_argument("--sup-short", default="./ai_supervised_v1/sup_short_eurusd_trendsr.pt")
+    parser.add_argument("--sup-threshold", type=float, default=0.55)
+    parser.add_argument("--sup-thresh-long", type=float, default=None)
+    parser.add_argument("--sup-thresh-short", type=float, default=None)
+    parser.add_argument("--sup-auto-threshold", action="store_true")
+    parser.add_argument("--disable-longs", action="store_true")
+    parser.add_argument("--disable-shorts", action="store_true")
+    parser.add_argument("--sup-hot-reload", action="store_true")
+    parser.add_argument("--adaptive-threshold", action="store_true")
+    parser.add_argument("--adaptive-window-trades", type=int, default=30)
+    parser.add_argument("--adaptive-loss-streak-trigger", type=int, default=3)
+    parser.add_argument("--adaptive-bump-per-loss", type=float, default=0.03)
+    parser.add_argument("--adaptive-bump-max", type=float, default=0.12)
+    parser.add_argument("--adaptive-cooldown-bars", type=int, default=36)
+    parser.add_argument("--adaptive-reset-after-bars", type=int, default=0)
+    parser.add_argument("--send-confidence", action="store_true")
+    parser.add_argument("--sup-min-prob-gap", type=float, default=0.0)
+    parser.add_argument("--sup-min-prob-gap-long", type=float, default=None)
+    parser.add_argument("--sup-min-prob-gap-short", type=float, default=None)
+    parser.add_argument("--sup-min-confidence", type=float, default=0.0)
+    parser.add_argument("--ifvg-retest-near-atr", type=float, default=None)
+    parser.add_argument("--max-trades-per-day", type=int, default=0)
+    parser.add_argument("--paper", action="store_true")
+    parser.add_argument("--log", default="./bridge_v31_signals.csv")
+    parser.add_argument("--disable-signal-log", action="store_true")
+    parser.add_argument("--log-max-mb", type=float, default=0.0)
+    parser.add_argument("--trades-log", default="./bridge_v31_trades.csv")
+    parser.add_argument("--disable-trades-log", action="store_true")
+    parser.add_argument("--trades-log-max-mb", type=float, default=0.0)
+    parser.add_argument("--mining", action="store_true", help="Skip model loading to generate training data.")
+
+    args = parser.parse_args()
+
+    global PIP_VALUE
+    if args.pair == "eurusd": PIP_VALUE = 0.0001
+    if float(args.pip_value) > 0: PIP_VALUE = float(args.pip_value)
+
+    params = load_best_params_from(study_name=args.study_name, storage_db=args.storage_db)
+    if args.min_gap_pips is not None: params.min_gap_pips = float(args.min_gap_pips)
+    if args.min_body_atr is not None: params.min_body_atr = float(args.min_body_atr)
+    if args.max_fvg_age_bars is not None: params.max_fvg_age_bars = int(args.max_fvg_age_bars)
+    if args.sl_buffer_atr is not None: params.sl_buffer_atr = float(args.sl_buffer_atr)
+    
+    base_margin = _quantize_pips_0p1(float(getattr(args, "tp_margin_pips", 0.0)))
+    params.tp_margin_long_pips = _quantize_pips_0p1(float(args.tp_margin_long_pips)) if args.tp_margin_long_pips is not None else float(base_margin)
+    params.tp_margin_short_pips = _quantize_pips_0p1(float(args.tp_margin_short_pips)) if args.tp_margin_short_pips is not None else float(base_margin)
+
+    n_features = int(BASE_FEATURES + (EXTRA_TREND_SR_FEATURES if args.trend_sr else 0) + (EXTRA_IFVG_ZONE_FEATURES if args.ifvg_zone_features else 0))
+    manager = None
+    sup_long = None
+    sup_short = None
+    sup_meta = {}
+    sup_mtime_long = -1.0
+    sup_mtime_short = -1.0
+
+    if args.mode == "rl":
+        env = DummyVecEnv([lambda: BridgeEnvV31(n_features)])
+        manager = ModelManager(env, checkpoint_dir=args.checkpoint_dir)
+    else:
+        if args.mining:
+            print("⛏️ MINING MODE: Skipping model loading.")
+        else:
+            try:
+                sup_long, meta_l = _load_supervised_model(str(args.sup_long), model_type=args.model_type, window_size=WINDOW_SIZE)
+                sup_short, meta_s = _load_supervised_model(str(args.sup_short), model_type=args.model_type, window_size=WINDOW_SIZE)
+                sup_meta = {"long": meta_l, "short": meta_s}
+                sup_mtime_long = _safe_mtime(str(args.sup_long))
+                sup_mtime_short = _safe_mtime(str(args.sup_short))
+            except Exception as e:
+                raise SystemExit(f"Failed to load supervised models: {e!r}")
+
+            model_in_dim = _supervised_input_dim(sup_long)
+            expected_in_dim = int(n_features) * int(WINDOW_SIZE)
+            
+            if model_in_dim is not None and int(model_in_dim) != int(expected_in_dim):
+                raise SystemExit(f"Supervised model input dim mismatch: model expects {int(model_in_dim)} but current config produces {int(expected_in_dim)}")
+
+    builder = LiveFeatureBuilder(
+        window_size=WINDOW_SIZE, params=params, trade_start_hour=int(args.trade_start_hour), trade_end_hour=int(args.trade_end_hour),
+        asia_start_hour=int(args.asia_start_hour), asia_end_hour=int(args.asia_end_hour), include_trend_sr=bool(args.trend_sr),
+        include_ifvg_zone_features=bool(args.ifvg_zone_features), use_ifvg_inversion_logic=(str(args.mode) == "supervised"),
+        ifvg_retest_near_atr=(float(args.ifvg_retest_near_atr) if getattr(args, "ifvg_retest_near_atr", None) is not None else None),
+        levels_mode=str(getattr(args, "levels_mode", "asia")), atr_sl_mult=float(getattr(args, "atr_sl_mult", 1.0)), atr_rr=float(getattr(args, "atr_rr", 1.4))
+    )
+
+    context = zmq.Context()
+    socket = context.socket(zmq.REP)
+    socket.bind(f"tcp://*:{int(args.port)}")
+    print(f"Bridge V31 listening on port {int(args.port)}...")
+
+    log_path = args.log
+    log_fieldnames = [
+        "ts_unix", "pair", "model_path", "day_id", "bar_in_day", "open", "high", "low", "close", "volume", "corr_close", "hour",
+        "in_time", "in_session", "asia_high", "asia_low", "bias", "day_trend_bias", "day_trend_is_set", "day_trend_slope_atr",
+        "atr_pips", "trend_slope_atr", "atr_ok", "allow_long", "allow_short", "action_model", "action_sent", "suppressed_by_disable",
+        "levels_ok", "sl", "tp", "rr_req", "rr", "tp_margin_long_pips", "tp_margin_short_pips", "tp_margin_used_pips", "intrade", "pnl",
+        # --- NEW V5 FEATURES LOGGED ---
+        "macro_trend", "vol_regime", "rsi"
+    ]
+    if args.mode == "supervised":
+        log_fieldnames += ["p_long", "p_short", "prob_gap", "sup_thresh", "sup_thresh_long", "sup_thresh_short", "sup_thresh_long_eff", "sup_thresh_short_eff", "confidence", "reject_reasons", "adaptive_on", "adaptive_bump", "adaptive_pf", "adaptive_loss_streak", "adaptive_cooldown", "choose_long", "choose_short"]
+
+    log_sink = _CsvSink(enabled=(not bool(getattr(args, "disable_signal_log", False))), label="signal log")
+    if log_sink.enabled:
+        _rotate_log_if_too_big(log_path, max_mb=float(getattr(args, "log_max_mb", 0.0) or 0.0))
+        _rotate_log_if_schema_changed(log_path, log_fieldnames)
+        try:
+            log_f = open(log_path, "a", newline="")
+            log_w = csv.DictWriter(log_f, fieldnames=log_fieldnames)
+            log_sink.file = log_f
+            log_sink.writer = log_w
+            if os.path.getsize(log_path) == 0: log_w.writeheader()
+        except Exception: pass
+
+    trades_log_path = args.trades_log
+    trades_sink = _CsvSink(enabled=(not bool(getattr(args, "disable_trades_log", False))), label="trades log")
+    if trades_sink.enabled:
+        try:
+            trades_f = open(trades_log_path, "a", newline="")
+            trades_w = csv.DictWriter(trades_f, fieldnames=["ts_open_unix", "ts_close_unix", "pair", "direction", "pnl", "win", "sl", "tp", "day_id_open", "bar_in_day_open", "day_id_close", "bar_in_day_close"])
+            trades_sink.file = trades_f
+            trades_sink.writer = trades_w
+            if os.path.getsize(trades_log_path) == 0: trades_w.writeheader()
+        except Exception: pass
+
+    adaptive = _AdaptiveQualityGate(enabled=bool(getattr(args, "adaptive_threshold", False)), window_trades=30, loss_streak_trigger=3, bump_per_loss=0.03, bump_max=0.12, cooldown_bars=36)
+
+    while True:
+        try:
+            msg = socket.recv_string()
+        except zmq.error.ZMQError:
+            time.sleep(0.1)
+            continue
+
+        try:
+            parts = [float(x.replace(",", ".")) for x in msg.split(";")]
+            if len(parts) < 5:
+                socket.send_string("0;0;0")
+                continue
+            open_, high, low, close = parts[0], parts[1], parts[2], parts[3]
+            hour = int(parts[4])
+            intrade = int(parts[5]) if len(parts) >= 6 else None
+            pnl = float(parts[6]) if len(parts) >= 7 else None
+            hour = int((hour + int(args.hour_offset)) % 24)
+            row = {"Open": open_, "High": high, "Low": low, "Close": close, "Volume": 0.0, "Corr_Close": 0.0, "Hour": hour}
+            builder.add_bar(row)
+            obs, mask = builder.get_obs_and_mask()
+            bar_index = int(getattr(builder, "_global_bar_index", 0))
+            
+            if obs is None:
+                socket.send_string("0;0;0")
+                continue
+
+            if (not args.mining) and args.mode == "supervised" and bool(args.sup_hot_reload):
+                 try:
+                     sup_long, sup_short, meta_new, sup_mtime_long, sup_mtime_short = _maybe_hot_reload_supervised(sup_long_path=str(args.sup_long), sup_short_path=str(args.sup_short), sup_long=sup_long, sup_short=sup_short, last_mtime_long=float(sup_mtime_long), last_mtime_short=float(sup_mtime_short), expected_input_dim=int(obs[0].reshape(1, -1).shape[1]), model_type=args.model_type, window_size=WINDOW_SIZE)
+                     if meta_new: sup_meta = meta_new
+                 except: pass
+
+            p_long = 0.0
+            p_short = 0.0
+            confidence = 0.0
+            action = 0
+            
+            if args.mining:
+                action = 0
+            elif args.mode == "rl":
+                if manager: action = manager.predict(obs, mask)
+            else:
+                if sup_long and sup_short:
+                    x = th.tensor(obs[0].reshape(1, -1), dtype=th.float32)
+                    with th.no_grad():
+                        p_long = float(th.sigmoid(sup_long(x)).item())
+                        p_short = float(th.sigmoid(sup_short(x)).item())
+                    confidence = float(max(p_long, p_short))
+                    thresh_long, thresh_short = _resolve_sup_thresholds(args=args, sup_meta=sup_meta)
+                    choose_long = mask[0, 1] and (p_long >= thresh_long)
+                    choose_short = mask[0, 2] and (p_short >= thresh_short)
+                    if choose_long: action = 1
+                    elif choose_short: action = 2
+
+            df = builder.history
+            last_atr = float(getattr(builder, "last_atr_pips", 0.0)) * PIP_VALUE
+            
+            macro_trend = 0.0
+            if len(df) >= 48:
+                y_reg = df["Close"].iloc[-48:].values.astype(float)
+                x_reg = np.arange(len(y_reg))
+                slope, _ = np.polyfit(x_reg, y_reg, 1)
+                macro_trend = (slope / max(last_atr, 1e-9)) * 10.0
+            
+            vol_regime = 1.0 
+            rsi_val = 0.0
+            try:
+                delta = df["Close"].diff()
+                gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                rs = gain / loss.replace(0, 1e-9)
+                rsi = 100 - (100 / (1 + rs))
+                rsi_val = (float(rsi.iloc[-1]) - 50.0) / 50.0
+            except: pass
+
+            levels = None
+            if action > 0: levels = builder.get_trade_levels(action)
+            action_sent = action if levels else 0
+            if args.paper: action_sent = 0
+            sl, tp = (0.0, 0.0)
+            if levels: _, sl, tp = levels
+
+            # --- KEY FIX FOR TRAINING ---
+            # Explicitly extract allow flags from mask to log them
+            allow_long_flag = 1 if mask[0, 1] else 0
+            allow_short_flag = 1 if mask[0, 2] else 0
+
+            row_log = {
+                "ts_unix": f"{time.time():.3f}",
+                "day_id": getattr(builder, "_day_id", 0),
+                "open": row["Open"], "high": row["High"], "low": row["Low"], "close": row["Close"], "hour": hour,
+                "p_long": f"{p_long:.4f}", "p_short": f"{p_short:.4f}",
+                "macro_trend": f"{macro_trend:.4f}", "vol_regime": f"{vol_regime:.4f}", "rsi": f"{rsi_val:.4f}",
+                "allow_long": allow_long_flag, "allow_short": allow_short_flag, # <--- THE FIX
+                "action_sent": action_sent, "sl": sl, "tp": tp
+            }
+            # Fill missing log keys
+            for k in log_fieldnames:
+                if k not in row_log: row_log[k] = ""
+
+            log_sink.write_row(row_log)
+            
+            if bool(getattr(args, "send_confidence", False)):
+                socket.send_string(f"{action_sent};{sl};{tp};{confidence:.4f}")
+            else:
+                socket.send_string(f"{action_sent};{sl};{tp}")
+
+        except Exception as e:
+            print(f"Error: {e}")
+            try: socket.send_string("0;0;0")
+            except: pass
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
